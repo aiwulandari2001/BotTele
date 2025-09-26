@@ -98,25 +98,28 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 help_cmd = start
 
 async def on_menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; data = q.data or ""; await q.answer()
+    q = update.callback_query
+    data = q.data or ""
+    await q.answer()
+
     if data == "menu_price":
-        txt = "Contoh: /price btc usdt"
+        txt = """Contoh:
 • /price btc usdt
 • /prices btc,eth idr
-• /convert 0.25 btc idr"
+• /convert 0.25 btc idr"""
     elif data == "menu_top":
-        txt = "• /top 10
+        txt = """• /top 10
 • /dominance
 • /fear
-• /gas"
+• /gas"""
     elif data == "menu_air":
-        txt = "• /airdrops
+        txt = """• /airdrops
 • /airdrops zk
-• /hunt monad"
+• /hunt monad"""
     else:
         txt = "• /ask pertanyaan apa saja"
-    await q.edit_message_text(txt)
 
+    await q.edit_message_text(txt)
 async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     fiat = get_chat_fiat(update.effective_chat.id)
     t0=time.time()
