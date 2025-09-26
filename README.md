@@ -26,6 +26,6 @@ python3 bot.py
 ## Catatan Termux
 Untuk fitur chart:
 ```bash
-pkg install -y freetype libpng
+apt install -y freetype libpng
 pip install matplotlib
 ```
