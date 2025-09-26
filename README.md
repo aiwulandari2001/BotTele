@@ -1,35 +1,31 @@
-# 🤖 Crypto Telegram Bot (Multi-Koin + AI Parser)
+# AirdropCore SUPER Bot PLUS (AI + Crypto + Airdrop Hunter)
 
-Bot Telegram untuk konversi **cryptocurrency ↔ fiat** maupun **crypto ↔ crypto**, mendukung **puluhan koin populer** (BTC, ETH, BNB, SOL, DOGE, SHIB, dll.) dan otomatis mengambil ribuan koin lain dari CoinGecko.
+## Fitur
+- AI pintar (/ask) — bahasa Indonesia
+- Harga: /price, /prices, /convert + auto-detect "harga btc"
+- Market: /top, /dominance, /fear, /gas
+- OHLC & Chart PNG: /ohlc, /chart
+- Alerts: /alert add|del & /alerts (cek setiap 60 detik)
+- Portfolio: /addport, /delport, /portfolio, /clearport
+- Airdrop Hunter: /airdrops [keyword], /hunt <keyword>
+- Inline menu, Markdown rapi, typing indicator
 
-Bot ini juga mendukung **perintah tanpa slash** dan dapat memahami **bahasa natural** seperti:
-
-- `tai 0.1 btc idr`
-- `berapa 3 eth usdt`
-- `0,25 sol ke rupiah`
-- `harga 1 doge idr`
-- `tolong hitung 2 bnb ke usd sekarang`
-
----
-
-## ✨ Fitur Utama
-- ✅ Konversi **multi-crypto** (BTC, ETH, BNB, SOL, dll.)
-- ✅ Konversi ke **berbagai fiat** (IDR, USD, EUR, JPY, dll.)
-- ✅ Auto-resolve ribuan koin lain dari **CoinGecko**
-- ✅ Format otomatis untuk **Rupiah (Rp)**
-- ✅ Parsing **tanpa slash command**
-- ✅ **AI Fallback** (OpenAI GPT) untuk memahami bahasa natural (opsional)
-- ✅ Cache harga (30 detik) agar tidak kena rate-limit CoinGecko
-- ✅ Mudah dijalankan di VPS / server 24/7 (support `systemd`)
-
----
-
-## 📦 Instalasi
-
-### 1. Clone Repo
+## Cara jalanin (Termux/VPS)
 ```bash
-git clone https://github.com/aiwulandari2001/BotTele.git
-cd crypto-bot```bash
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# jika sebelumnya pakai webhook:
 TOKEN=$(grep ^BOT_TOKEN .env | cut -d= -f2-)
 curl "https://api.telegram.org/bot$TOKEN/deleteWebhook?drop_pending_updates=true"
+
+python3 bot.py
+```
+
+## Catatan Termux
+Untuk fitur chart:
+```bash
+pkg install -y freetype libpng
+pip install matplotlib
 ```
