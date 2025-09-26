@@ -261,7 +261,7 @@ async def reply_convert(update: Update, amount_s: str, sym: str, fiat: str):
     )
 
 # ---------- Airdrop ----------
-def find_airdrop(slug: str) -> Airdrop | None:
+def find_airdrop(slug: str) -> Optional[Airdrop]:
     s = slug.lower()
     for a in AIRDROPS:
         if a.slug == s or a.slug in s or a.name.lower() == s:
