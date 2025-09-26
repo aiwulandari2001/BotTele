@@ -2,6 +2,7 @@
 import os, re, json, logging, requests
 from typing import Dict, List, Tuple
 from dataclasses import dataclass, field
+from typing import Optional
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup
