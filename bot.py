@@ -129,9 +129,9 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cg = f"✅ {(time.time()-t0)*1000:.0f} ms"
     except Exception as e:
         cg=f"❌ {e.__class__.__name__}"
-    await update.message.reply_text(f"🩺 Status:
+    await update.message.reply_text(f"""🩺 Status:
 • CoinGecko: {cg}
-• FIAT: {fiat.upper()}")
+• FIAT: {fiat.upper()}""")
 
 async def setfiat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
