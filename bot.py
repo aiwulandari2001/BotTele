@@ -135,12 +135,14 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def setfiat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
-        await update.message.reply_text(f"FIAT saat ini: {get_chat_fiat(update.effective_chat.id).upper()}
-Format: /setfiat idr|usd|usdt|eur"); return
-    fiat = ctx.args[0].lower()
-    if fiat not in {"idr","usd","usdt","eur"}:
-        await update.message.reply_text("❌ Fiat tidak dikenal. Pilih: idr|usd|usdt|eur"); return
-    set_chat_fiat(update.effective_chat.id, fiat)
+        await update.message.reply_text(f"""FIAT saat ini: {get_chat_fiat(update.effective_chat.id).upper()}
+Format: /setfiat idr|usd|usdt|eur""")
+return
+
+fiat = ctx.args[0].lower()
+if fiat not in {"idr", "usd", "usdt", "eur"}:
+    await update.message.reply_text("❌ FIAT tidak valid. Pilih salah satu: idr, usd, usdt, eur.")
+    returnset_chat_fiat(update.effective_chat.id, fiat)
     await update.message.reply_text(f"✅ FIAT default di-set ke {fiat.upper()}")
 
 # === AI ===
