@@ -100,7 +100,7 @@ help_cmd = start
 async def on_menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; data = q.data or ""; await q.answer()
     if data == "menu_price":
-        txt = "Contoh:
+        txt = "Contoh: /price btc usdt"
 • /price btc usdt
 • /prices btc,eth idr
 • /convert 0.25 btc idr"
