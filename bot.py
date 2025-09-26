@@ -4,7 +4,9 @@ from typing import Dict, List, Tuple
 from dataclasses import dataclass, field
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatAction,
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
+)
+from telegram.constants import ChatAction
 )
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
