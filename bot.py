@@ -1,84 +1,96 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# bot.py
 import os, re, logging, requests
+from typing import List, Tuple, Dict
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     ContextTypes, filters, CallbackQueryHandler
 )
 
-# --- OpenAI opsional (agar tidak crash kalau modul belum terpasang) ---
+# ===================== OpenAI (opsional) =====================
+# Gunakan library OpenAI baru: pip install openai
 try:
     from openai import OpenAI
 except Exception:
-    OpenAI = None
+    OpenAI = None  # supaya tidak error kalau openai belum terpasang
 
-# ===== Konfigurasi dasar =====
+# ===================== Konfigurasi dasar =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "ISI_TOKEN_KAMU")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "ISI_API_KEY_KAMU")
-FIAT_DEFAULT = os.getenv("FIAT_DEFAULT", "usd").lower()
+FIAT_DEFAULT = os.getenv("FIAT_DEFAULT", "usd").lower()  # bisa diubah via /setfiat
 
+# Inisialisasi OpenAI client bila kunci tersedia & lib ada
 client = None
 if OpenAI and OPENAI_API_KEY and not OPENAI_API_KEY.startswith("ISI_"):
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
     except Exception as e:
-        client = None
-        logging.warning("OpenAI init gagal: %s", e)
+        print("OpenAI init fail:", e)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
 
-# ===== Utilitas =====
-def fetch_price(symbols, fiat="usd"):
+# ===================== Utilitas =====================
+# Pemetaan ticker→id CoinGecko (boleh ditambah)
+SYMBOL_MAP: Dict[str, str] = {
+    # layer-1 / bluechips
+    "btc": "bitcoin", "eth": "ethereum", "sol": "solana", "ada": "cardano",
+    "xrp": "ripple", "dot": "polkadot", "avax": "avalanche-2", "atom": "cosmos",
+    # exchange / stable
+    "bnb": "binancecoin", "trx": "tron", "usdt": "tether", "usdc": "usd-coin",
+    # layer-2 / ekosistem populer
+    "matic": "polygon", "arb": "arbitrum", "op": "optimism", "base": "base-protocol",
+    # meme / others
+    "doge": "dogecoin", "shib": "shiba-inu", "pepe": "pepe",
+}
+
+# sebagian vs_currency CoinGecko tidak mendukung "usdt".
+# Kita map "usdt" → "usd" untuk query, tapi label tetap USDT.
+def _fiat_for_query(fiat: str) -> Tuple[str, str]:
+    f = fiat.lower()
+    if f == "usdt":
+        return "usd", "USDT"  # query pakai USD, label tampilkan USDT
+    return f, f.upper()
+
+def norm_symbol(sym: str) -> str:
+    s = (sym or "").lower()
+    return SYMBOL_MAP.get(s, s)
+
+def fetch_price(symbol_ids: List[str], fiat: str) -> dict:
+    if not symbol_ids:
+        return {}
+    q_fiat, _ = _fiat_for_query(fiat)
     url = "https://api.coingecko.com/api/v3/simple/price"
     try:
-        resp = requests.get(
+        r = requests.get(
             url,
             params={
-                "ids": ",".join(symbols),
-                "vs_currencies": fiat,
+                "ids": ",".join(symbol_ids),
+                "vs_currencies": q_fiat,
                 "include_24hr_change": "true",
             },
             timeout=20,
         )
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
+        r.raise_for_status()
+        return r.json()
+    except Exception:
         log.exception("fetch_price error")
         return {}
 
-def fmt_price(val, fiat):
-    try:
-        if fiat == "idr":
-            return f"Rp {val:,.0f}".replace(",", ".")
-        if fiat in ("usd", "usdt"):
-            return f"${val:,.2f}"
-        if fiat == "eur":
-            return f"€{val:,.2f}"
-    except Exception:
-        pass
-    return f"{val:,.4f} {fiat.upper()}"
+def fmt_price(val, fiat: str) -> str:
+    # angka besar → 2 desimal, kecil → 6 desimal
+    if val is None:
+        return "-"
+    dec = 2 if float(val) >= 1 else 6
+    _, fiat_label = _fiat_for_query(fiat)
+    return f"{float(val):,.{dec}f} {fiat_label}"
 
-def norm_symbol(sym):
-    mapping = {
-        "btc": "bitcoin", "eth": "ethereum", "bnb": "binancecoin",
-        "usdt": "tether", "usdc": "usd-coin", "sol": "solana",
-        "ada": "cardano", "xrp": "ripple", "dot": "polkadot",
-        "doge": "dogecoin", "trx": "tron", "matic": "matic-network",
-        "ton": "toncoin", "avax": "avalanche-2", "ltc": "litecoin",
-        "shib": "shiba-inu", "link": "chainlink", "op": "optimism",
-        "arb": "arbitrum", "sui": "sui", "sei": "sei-network",
-        "near": "near", "atom": "cosmos", "cake": "pancakeswap-token"
-    }
-    return mapping.get(sym.lower(), sym.lower())
+# Pattern untuk "harga/price XXX YYY" dan pasangan sederhana
+RE_HARGA = re.compile(r"^(?:harga|price)\s+([a-z0-9]+)(?:\s+([a-z0-9]+))?$", re.I)
+PAIR_PATTERN = re.compile(r"^([a-z0-9]+)[/ ]([a-z0-9]+)$", re.I)
 
-# Deteksi teks natural:
-PRICE_WORD = re.compile(r"(?i)^(harga|price)\b")
-PAIR_PATTERN = re.compile(r"(?i)^(?:harga|price)\s+([a-z0-9$.,]+)(?:[\/\s]+([a-z]{2,6}))?$")
-CONVERT_PATTERN = re.compile(r"(?i)^(\d+(?:[.,]\d+)?)\s*([a-z0-9$]{2,12})\s*(?:ke|to)\s*([a-z]{2,6})$")
-
-# ===== Command handlers =====
+# ===================== Command handlers =====================
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = [
         [InlineKeyboardButton("💰 Harga", callback_data="menu_price"),
@@ -87,59 +99,76 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("🤖 AI", callback_data="menu_ai")],
     ]
     await update.message.reply_text(
-        "Selamat datang di AirdropCore Bot!\nGunakan menu di bawah ini:",
+        "Selamat datang di AirdropCore Bot!\nPilih menu di bawah ini 👇",
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Perintah tersedia:\n"
-        "/price btc usdt – harga 1 coin\n"
-        "/prices btc,eth idr – harga beberapa coin\n"
-        "/convert 0.25 btc idr – konversi jumlah\n"
-        "/setfiat idr|usd|usdt|eur – ganti fiat default\n"
-        "/ask <pertanyaan> – tanya AI\n"
+        "Perintah:\n"
+        "• /price <symbol> [fiat]\n"
+        "  contoh: /price btc usdt\n"
+        "• /prices <sym1,sym2,...> [fiat]\n"
+        "  contoh: /prices btc,eth,idr\n"
+        "• /convert <jumlah> <symbol> <fiat>\n"
+        "  contoh: /convert 0.25 btc idr\n"
+        "• /setfiat idr|usd|usdt|eur\n"
+        "• /ask <pertanyaan>\n"
+        "• /status"
+    )
+
+async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cg = "OK"
+    ai = "ON" if client else "OFF"
+    await update.message.reply_text(
+        f"🩺 Status:\n"
+        f"• CoinGecko: {cg}\n"
+        f"• FIAT: {FIAT_DEFAULT.upper()}\n"
+        f"• OpenAI: {ai}"
     )
 
 async def setfiat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global FIAT_DEFAULT  # <-- HARUS DI BARIS PALING ATAS DALAM FUNGSI
+
     if not ctx.args:
         await update.message.reply_text(
             f"FIAT saat ini: {FIAT_DEFAULT.upper()}\n"
             "Format: /setfiat idr|usd|usdt|eur"
         )
         return
+
     fiat = ctx.args[0].lower()
     if fiat not in {"idr", "usd", "usdt", "eur"}:
         await update.message.reply_text("❌ Fiat tidak valid. Pilih: idr|usd|usdt|eur")
         return
-    global FIAT_DEFAULT
+
     FIAT_DEFAULT = fiat
     await update.message.reply_text(f"✅ FIAT default diset ke {fiat.upper()}")
 
 async def ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not client:
+        await update.message.reply_text("❌ OpenAI belum dikonfigurasi.")
+        return
     prompt = " ".join(ctx.args).strip()
     if not prompt:
         await update.message.reply_text("Format: /ask <pertanyaan>")
         return
-    if not client:
-        await update.message.reply_text("❌ AI nonaktif (OPENAI_API_KEY kosong / modul openai belum terpasang).")
-        return
     try:
         resp = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL","gpt-4o-mini"),
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=400, temperature=0.4,
-            timeout=30  # timeout network
+            max_tokens=400,
+            temperature=0.5,
         )
         answer = resp.choices[0].message.content.strip()
         await update.message.reply_text(answer)
     except Exception as e:
-        logging.exception("AI error")
+        log.exception("AI error")
         await update.message.reply_text(f"❌ Error AI: {e}")
 
 async def price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
-        await update.message.reply_text("Format: /price <symbol> [fiat]\ncontoh: /price btc usdt")
+        await update.message.reply_text("Format: /price <symbol> [fiat]\nContoh: /price btc usdt")
         return
     sym = ctx.args[0]
     fiat = (ctx.args[1] if len(ctx.args) > 1 else FIAT_DEFAULT).lower()
@@ -147,79 +176,51 @@ async def price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def prices(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
-        await update.message.reply_text("Format: /prices <sym1,sym2,...> [fiat]\ncontoh: /prices btc,eth idr")
+        await update.message.reply_text("Format: /prices <sym1,sym2,...> [fiat]")
         return
-    syms = [s.strip() for s in ctx.args[0].split(",") if s.strip()]
+    raw = ctx.args[0]
     fiat = (ctx.args[1] if len(ctx.args) > 1 else FIAT_DEFAULT).lower()
-    await _reply_prices(update, syms, fiat)
+    syms = [s.strip() for s in re.split(r"[,\s]+", raw) if s.strip()]
+    ids = [norm_symbol(s) for s in syms]
+    data = fetch_price(ids, fiat)
+    if not data:
+        await update.message.reply_text("❌ Data tidak ditemukan.")
+        return
+    lines = []
+    for s, cid in zip(syms, ids):
+        val = (data.get(cid) or {}).get(_fiat_for_query(fiat)[0])
+        chg = (data.get(cid) or {}).get(f"{_fiat_for_query(fiat)[0]}_24h_change")
+        chg_txt = f" (24h: {chg:+.2f}%)" if isinstance(chg, (int, float)) else ""
+        lines.append(f"• {s.upper():<6} = {fmt_price(val, fiat)}{chg_txt}")
+    await update.message.reply_text("📈 Harga:\n" + "\n".join(lines))
 
 async def convert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args or len(ctx.args) < 3:
-        await update.message.reply_text("Format: /convert <amount> <coin> <fiat>\ncontoh: /convert 0.25 btc idr")
+    if len(ctx.args) < 3:
+        await update.message.reply_text("Format: /convert <jumlah> <symbol> <fiat>\nContoh: /convert 0.25 btc idr")
         return
     try:
-        amount = float(str(ctx.args[0]).replace(",", "."))
+        amount = float(ctx.args[0])
     except ValueError:
-        await update.message.reply_text("Jumlah tidak valid.")
+        await update.message.reply_text("❌ Jumlah tidak valid.")
         return
     sym = ctx.args[1]
     fiat = ctx.args[2].lower()
-    await _reply_convert(update, amount, sym, fiat)
+    cid = norm_symbol(sym)
+    data = fetch_price([cid], fiat)
+    q_fiat, _ = _fiat_for_query(fiat)
+    if cid not in data or q_fiat not in data[cid]:
+        await update.message.reply_text("❌ Data tidak ditemukan.")
+        return
+    px = float(data[cid][q_fiat])
+    total = amount * px
+    await update.message.reply_text(
+        f"🔁 {amount:g} {sym.upper()} ≈ {fmt_price(total, fiat)} (1 {sym.upper()} = {fmt_price(px, fiat)})"
+    )
 
-# ===== Implementasi =====
-async def _reply_price(update: Update, sym: str, fiat: str):
-    try:
-        cid = norm_symbol(sym)
-        data = fetch_price([cid], fiat)
-        if cid not in data or fiat not in data[cid]:
-            await update.message.reply_text(f"❌ {sym.upper()} atau {fiat.upper()} tidak ditemukan.")
-            return
-        price_val = data[cid][fiat]
-        chg = data[cid].get(f"{fiat}_24h_change")
-        chg_txt = f" (24h: {chg:+.2f}%)" if isinstance(chg, (int, float)) else ""
-        await update.message.reply_text(f"💰 {sym.upper()} = {fmt_price(price_val, fiat)}{chg_txt}")
-    except Exception as e:
-        logging.exception("price error")
-        await update.message.reply_text(f"❌ Error harga: {e}")
-
-async def _reply_prices(update: Update, syms, fiat: str):
-    try:
-        ids = [norm_symbol(s) for s in syms]
-        data = fetch_price(ids, fiat)
-        lines = []
-        for s, cid in zip(syms, ids):
-            if cid in data and fiat in data[cid]:
-                p = data[cid][fiat]
-                chg = data[cid].get(f"{fiat}_24h_change")
-                chg_txt = f" (24h: {chg:+.2f}%)" if isinstance(chg, (int, float)) else ""
-                lines.append(f"{s.upper():>5} = {fmt_price(p, fiat)}{chg_txt}")
-            else:
-                lines.append(f"{s.upper():>5} = n/a")
-        await update.message.reply_text("📊 Harga:\n" + "\n".join(lines))
-    except Exception as e:
-        logging.exception("prices error")
-        await update.message.reply_text(f"❌ Error harga: {e}")
-
-async def _reply_convert(update: Update, amount: float, sym: str, fiat: str):
-    try:
-        cid = norm_symbol(sym)
-        data = fetch_price([cid], fiat)
-        if cid not in data or fiat not in data[cid]:
-            await update.message.reply_text(f"❌ {sym.upper()} atau {fiat.upper()} tidak ditemukan.")
-            return
-        p = float(data[cid][fiat])
-        total = amount * p
-        await update.message.reply_text(
-            f"🔁 {amount:g} {sym.upper()} ≈ {fmt_price(total, fiat)} (1 {sym.upper()} = {fmt_price(p, fiat)})"
-        )
-    except Exception as e:
-        logging.exception("convert error")
-        await update.message.reply_text(f"❌ Error konversi: {e}")
-
-# ===== Menu callback =====
+# ===================== Menu callback =====================
 async def on_menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    data = q.data or ""
+    data = (q.data or "").strip()
     await q.answer()
     if data == "menu_price":
         txt = (
@@ -230,62 +231,84 @@ async def on_menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     elif data == "menu_top":
         txt = (
-            "• /setfiat idr|usd|usdt|eur\n"
-            "• /ask <pertanyaan>\n"
-            "• /help"
+            "Contoh indikator:\n"
+            "• /top 10 (belum diaktifkan)\n"
+            "• /dominance (coming soon)\n"
+            "• /fear (coming soon)"
         )
     elif data == "menu_air":
         txt = (
-            "Airdrop (versi ringkas). Kamu bisa tanya pakai /ask untuk ringkasan airdrop/project."
+            "Airdrop (coming soon):\n"
+            "• /airdrops\n"
+            "• /airdrops zk\n"
+            "• /hunt monad"
         )
     else:
-        txt = "• /ask pertanyaan apa saja"
+        txt = "Tanya AI: /ask <pertanyaan>"
     await q.edit_message_text(txt)
 
-# ===== Router untuk pesan teks =====
+# ===================== Router pesan teks =====================
 async def text_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
-    # "0.1 btc ke idr"
-    m2 = CONVERT_PATTERN.match(text)
-    if m2:
-        amt = float(m2.group(1).replace(",", "."))
-        sym, fiat = m2.group(2), m2.group(3).lower()
-        await _reply_convert(update, amt, sym, fiat)
-        return
-
-    # "harga btc usdt" / "price eth usd"
-    m = PAIR_PATTERN.match(text) if PRICE_WORD.match(text) else None
+    # Pola "harga/price <sym> [fiat]"
+    m = RE_HARGA.match(text)
     if m:
         sym, fiat = m.groups()
         fiat = (fiat or FIAT_DEFAULT).lower()
         await _reply_price(update, sym, fiat)
         return
 
-    # fallback ke AI
-    if client:
+    # Pola "<sym>/<fiat>" atau "<sym> <fiat>"
+    m2 = PAIR_PATTERN.match(text)
+    if m2:
+        sym, fiat = m2.groups()
+        await _reply_price(update, sym, fiat.lower())
+        return
+
+    # Fallback ke AI bila tersedia
+    if client and text:
         try:
             resp = client.chat.completions.create(
-                model=os.getenv("OPENAI_MODEL","gpt-4o-mini"),
+                model="gpt-4o-mini",
                 messages=[{"role": "user", "content": text}],
-                max_tokens=220, temperature=0.6,
-                timeout=30
+                max_tokens=220,
+                temperature=0.6,
             )
             answer = resp.choices[0].message.content.strip()
             await update.message.reply_text(answer)
+            return
         except Exception as e:
-            logging.exception("AI fallback error")
+            log.exception("AI fallback error")
             await update.message.reply_text(f"❌ Error: {e}")
 
-# ===== Runner =====
-def main():
-    if not BOT_TOKEN or BOT_TOKEN.startswith("ISI_"):
-        print("ERROR: BOT_TOKEN belum diisi. Set environment atau .env Anda.")
-        raise SystemExit(1)
+    # Bila tidak cocok apa pun
+    await update.message.reply_text("Ketik contoh: harga btc usdt  /  /price eth idr  /  /help")
 
+# ===================== Helper reply =====================
+async def _reply_price(update: Update, sym: str, fiat: str):
+    try:
+        cid = norm_symbol(sym)
+        data = fetch_price([cid], fiat)
+        q_fiat, _ = _fiat_for_query(fiat)
+        if cid not in data or q_fiat not in data[cid]:
+            await update.message.reply_text(f"❌ {sym.upper()} atau {fiat.upper()} tidak ditemukan.")
+            return
+        price_val = data[cid][q_fiat]
+        chg = data[cid].get(f"{q_fiat}_24h_change")
+        chg_txt = f" (24h: {chg:+.2f}%)" if isinstance(chg, (int, float)) else ""
+        await update.message.reply_text(f"💰 {sym.upper()} = {fmt_price(price_val, fiat)}{chg_txt}")
+    except Exception:
+        log.exception("price error")
+        await update.message.reply_text("❌ Error mengambil harga.")
+
+# ===================== Runner =====================
+def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("setfiat", setfiat))
     app.add_handler(CommandHandler("ask", ask))
     app.add_handler(CommandHandler("price", price))
@@ -293,6 +316,7 @@ def main():
     app.add_handler(CommandHandler("convert", convert))
     app.add_handler(CallbackQueryHandler(on_menu_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+
     log.info("Bot polling started…")
     app.run_polling(drop_pending_updates=True)
 
