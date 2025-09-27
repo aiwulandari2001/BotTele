@@ -1,12 +1,16 @@
-# bot.py — AirdropCore Super Bot (Crypto + Airdrops + AI)
-import os, re, time, math, logging, json, html
+# bot.py — AirdropCore Super Bot (Crypto + Airdrops + AI + Pagination)
+import os, re, time, math, json, logging, html
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
+)
+from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     ContextTypes, filters, CallbackQueryHandler
@@ -38,14 +42,19 @@ logging.basicConfig(
 log = logging.getLogger("airdropcore.bot")
 
 # =====================
-# Regex untuk input bebas (harga/convert)
+# Executor (scrape di thread)
+# =====================
+executor = ThreadPoolExecutor(max_workers=4)
+
+# =====================
+# Regex input bebas (harga/convert)
 # =====================
 RX_AMOUNT_PAIR = re.compile(r"^\s*([\d\.,]+)\s+([a-z0-9\-]+)\s+([a-z]{2,6})\s*$", re.I)   # "0.1 btc idr"
 RX_PAIR_ONLY   = re.compile(r"^\s*([a-z0-9\-]{2,15})[/\s]+([a-z]{2,6})\s*$", re.I)        # "btc/usdt" / "btc usd"
 RX_PRICE_WORD  = re.compile(r"^(?:harga|price)\s+([a-z0-9\-]{2,15})(?:[/\s]+([a-z]{2,6}))?$", re.I)
 
 # =====================
-# Resolver simbol → CoinGecko ID (ribuan koin)
+# CoinGecko resolver: symbol -> id (ribuan koin)
 # =====================
 CG_LIST_URL = "https://api.coingecko.com/api/v3/coins/list"
 CG_SIMPLE_PRICE = "https://api.coingecko.com/api/v3/simple/price"
@@ -71,7 +80,7 @@ STATIC_MAP = {
     "ton":"the-open-network",
     "arb":"arbitrum","op":"optimism","avax":"avalanche-2",
     "link":"chainlink","uni":"uniswap","inj":"injective-protocol",
-    # Tambah override di sini bila perlu, contoh:
+    # contoh override lain:
     # "pi":"pi-network",
 }
 
@@ -88,8 +97,7 @@ def _refresh_coin_cache(force: bool=False) -> None:
         for c in coins:
             sym = (c.get("symbol") or "").lower()
             cid = c.get("id")
-            if not sym or not cid:
-                continue
+            if not sym or not cid: continue
             cache.setdefault(sym, cid)
         for k, v in STATIC_MAP.items():  # alias prioritas
             cache[k] = v
@@ -127,153 +135,151 @@ def fmt_price(val: float, fiat: str) -> str:
         return f"{val} {fiat.upper()}"
     if v == 0: return f"0 {fiat.upper()}"
     if v < 1:
+        import math
         digits = max(2, min(8, -int(math.floor(math.log10(v)))+2))
         return f"{v:.{digits}f} {fiat.upper()}"
     return f"{v:,.2f} {fiat.upper()}"
 
 # =====================
-# AIRDROP SCRAPER
+# Airdrop cache & scraper
 # =====================
-@dataclass
-class Airdrop:
-    slug: str
-    name: str
-    chain: str = ""
-    reward: str = ""
-    link: str = ""
-    status: str = ""       # ongoing/upcoming/ended
-    tasks: List[str] = field(default_factory=list)
-    source: str = ""       # airdrops.io / cryptorank
+AIR_CACHE = Path("airdrops_cache.json")
+AIRDROPS: List[dict] = []
+PAGE_SIZE = 15
 
-CACHE_FILE = "airdrops_cache.json"
-CACHE_TTL  = 6*3600
-
-def _load_cache() -> Tuple[float, List[Dict]]:
-    try:
-        if not os.path.exists(CACHE_FILE): return 0, []
-        data = json.load(open(CACHE_FILE, "r", encoding="utf-8"))
-        return data.get("time",0), data.get("items",[])
-    except Exception:
-        return 0, []
-
-def _save_cache(items: List[Dict]) -> None:
-    try:
-        json.dump({"time": time.time(), "items": items}, open(CACHE_FILE,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-def extract_tasks(html_text: str) -> List[str]:
-    soup = BeautifulSoup(html_text, "html.parser")
-    tasks = []
-    for ul in soup.select("ul, ol"):
-        lis = [li.get_text(" ", strip=True) for li in ul.select("li")]
-        if not lis: continue
-        blob = " ".join(lis).lower()
-        if any(k in blob for k in ["quest","galxe","zealy","discord","twitter","x.com","bridge","swap","mint","faucet","testnet","task"]):
-            tasks.extend(lis); break
-    if not tasks:
-        paras = [p.get_text(" ", strip=True) for p in soup.select("p") if len(p.get_text(strip=True))>60]
-        tasks = paras[:6]
-    clean = []
-    for t in tasks:
-        t = re.sub(r"\s+"," ", t).replace("·","-").strip()
-        if t and t not in clean: clean.append(t)
-    return clean[:12]
-
-def extract_meta(html_text: str) -> Dict[str,str]:
-    soup = BeautifulSoup(html_text, "html.parser")
-    txt = soup.get_text(" ", strip=True)
-    meta = {}
-    m = re.search(r"Chain\s*[:\-]\s*([A-Za-z0-9 \-_/]+)", txt, re.I)
-    if m: meta["chain"] = m.group(1)[:50]
-    m = re.search(r"Reward\s*[:\-]\s*([A-Za-z0-9 \$\.\,\+\-\(\)]+)", txt, re.I)
-    if m: meta["reward"] = m.group(1)[:80]
-    return meta
-
-def dedupe(items: List[Airdrop]) -> List[Airdrop]:
-    seen, out = set(), []
-    for it in items:
-        key = (it.name.lower(), it.link)
-        if key in seen: continue
-        seen.add(key); out.append(it)
-    return out
-
-def scrape_airdrops_io() -> List[Airdrop]:
-    out: List[Airdrop] = []
-    pages = [("https://airdrops.io/ongoing/","ongoing"), ("https://airdrops.io/upcoming/","upcoming")]
-    for url, status in pages:
+def load_airdrops_from_cache() -> List[dict]:
+    global AIRDROPS
+    if AIR_CACHE.exists():
         try:
-            r = requests.get(url, headers=UA, timeout=25); r.raise_for_status()
-            soup = BeautifulSoup(r.text, "html.parser")
-            cards = soup.select("div.project, div.card, article, div.airdrop")
-            if not cards: cards = soup.select("a[href*='/airdrop/'], a[href*='airdrops.io/']")
-            for c in cards:
-                a = c.select_one("a[href]")
-                title = (a.get_text(strip=True) if a else c.get_text(" ", strip=True))[:120]
-                href  = (a["href"] if a and a.has_attr("href") else "").strip()
-                if href.startswith("/"): href = "https://airdrops.io"+href
-                if not title or not href: continue
-                slug = re.sub(r"[^a-z0-9]+","-", title.lower()).strip("-")
-                item = Airdrop(slug=slug, name=title, link=href, status=status, source="airdrops.io")
-                try:
-                    rr = requests.get(href, headers=UA, timeout=25)
-                    if rr.ok:
-                        item.tasks = extract_tasks(rr.text) or item.tasks
-                        meta = extract_meta(rr.text)
-                        item.chain = meta.get("chain","") or item.chain
-                        item.reward = meta.get("reward","") or item.reward
-                except Exception:
-                    pass
-                out.append(item)
+            AIRDROPS = json.loads(AIR_CACHE.read_text(encoding="utf-8"))
         except Exception:
-            log.warning("Scrape airdrops.io gagal: %s", url, exc_info=True)
-    return dedupe(out)
+            log.exception("Gagal baca cache airdrops (fallback kosong)")
+            AIRDROPS = []
+    else:
+        AIRDROPS = []
+    return AIRDROPS
 
-def scrape_cryptorank() -> List[Airdrop]:
-    url = "https://cryptorank.io/airdrops"
-    out: List[Airdrop] = []
+def save_airdrops_to_cache(items: List[dict]) -> None:
     try:
-        r = requests.get(url, headers=UA, timeout=25); r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        rows = soup.select("a[href*='/airdrops/']")
-        for a in rows:
-            title = a.get_text(" ", strip=True)
-            href  = a.get("href","")
-            if href.startswith("/"): href = "https://cryptorank.io"+href
-            if not title or not href: continue
-            slug = re.sub(r"[^a-z0-9]+","-", title.lower()).strip("-")
-            out.append(Airdrop(slug=slug, name=title, link=href, status="ongoing", source="cryptorank"))
+        AIR_CACHE.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
-        log.warning("Scrape cryptorank gagal", exc_info=True)
-    return dedupe(out)
+        log.exception("Gagal simpan cache airdrops")
 
-def scrape_all(force: bool=False) -> List[Airdrop]:
-    ts, cached = _load_cache()
-    if cached and not force and (time.time()-ts) < CACHE_TTL:
-        return [Airdrop(**c) for c in cached]
-    items: List[Airdrop] = []
-    items += scrape_airdrops_io()
-    items += scrape_cryptorank()
-    items = dedupe(items)
-    _save_cache([i.__dict__ for i in items])
+HEADERS = {"User-Agent": "Mozilla/5.0 (AirdropCoreBot)"}
+
+def _fetch(url: str) -> str:
+    r = requests.get(url, headers=HEADERS, timeout=25)
+    r.raise_for_status()
+    return r.text
+
+def _clean(text: str) -> str:
+    return " ".join((text or "").split())
+
+def parse_generic_listing(html_text: str, base_url: str) -> List[dict]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    items = []
+    for a in soup.select("a[href]"):
+        title = _clean(a.get_text(" ", strip=True))
+        href  = a.get("href") or ""
+        if not title or len(title) < 5: continue
+        if href.startswith("/"): href = base_url.rstrip("/") + href
+        low = (title + " " + href).lower()
+        if any(k in low for k in ["airdrop", "quest", "reward", "galxe", "campaign"]):
+            items.append({
+                "name": title[:100],
+                "slug": re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:80],
+                "url": href,
+                "source": base_url,
+                "status": "",  # bisa ditebak kalau mau
+            })
     return items
 
-def fuzzy_find(items: List[Airdrop], q: str) -> Optional[Airdrop]:
-    ql = q.lower().strip()
-    if not ql: return None
-    for a in items:
-        if ql == a.slug or ql == a.name.lower() or ql in a.name.lower() or ql in a.slug:
-            return a
-    best, score = None, 0
-    for a in items:
-        s = a.name.lower()
-        common = len(set(ql.split()) & set(s.split()))
-        if common > score:
-            best, score = a, common
-    return best
+def scrape_all_sources() -> List[dict]:
+    sources = [
+        ("https://airdrops.io/latest", "https://airdrops.io"),
+        ("https://coinmarketcap.com/airdrop/", "https://coinmarketcap.com"),
+        ("https://cryptorank.io/airdrops", "https://cryptorank.io"),
+        ("https://galxe.com/explore", "https://galxe.com"),
+    ]
+    collected: List[dict] = []
+    for url, base in sources:
+        try:
+            html_text = _fetch(url)
+            items = parse_generic_listing(html_text, base)
+            collected.extend(items)
+        except Exception as e:
+            log.warning("Gagal scraping %s: %s", url, e)
+    # dedupe by (slug,url)
+    uniq: Dict[Tuple[str,str], dict] = {}
+    for it in collected:
+        key = (it.get("slug",""), it.get("url",""))
+        if key not in uniq:
+            uniq[key] = it
+    items = list(uniq.values())
+    items.sort(key=lambda x: x.get("name","").lower())
+    return items[:300]
+
+def scrape_tasks(url: str) -> List[str]:
+    """Ambil kemungkinan daftar tugas dari halaman sumber + ringkas (jika AI aktif)."""
+    try:
+        r = requests.get(url, timeout=25, headers=HEADERS)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        raw = [x.get_text(" ", strip=True) for x in soup.select("li, p")]
+        steps = [s for s in raw if any(k in s.lower() for k in [
+            "join","follow","retweet","repost","discord","galxe","zealy",
+            "quest","task","mission","bridge","swap","mint","testnet","submit"
+        ])]
+        if client and steps:
+            joined = "\n".join(steps[:20])
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role":"user","content": f"Ringkas jadi checklist tugas singkat dan jelas:\n{joined}"}],
+                max_tokens=320, temperature=0.2
+            )
+            txt = resp.choices[0].message.content.strip().splitlines()
+            steps = [s.strip("•- ") for s in txt if s.strip()]
+        return steps or ["⚠️ Tidak ada tugas terdeteksi dari halaman sumber."]
+    except Exception as e:
+        log.exception("scrape_tasks error")
+        return [f"❌ Error mengambil tugas: {e}"]
 
 # =====================
-# UI / Handlers
+# UI Helpers (Airdrops + Pagination)
+# =====================
+def format_airdrop_list(items: List[dict], page: int, page_size: int = PAGE_SIZE) -> str:
+    total = len(items)
+    if total == 0:
+        return "Belum ada data airdrop."
+    pages = max(1, (total + page_size - 1)//page_size)
+    page = max(1, min(page, pages))
+    start = (page-1)*page_size
+    subset = items[start:start+page_size]
+    lines = [f"Daftar Airdrop (Hal {page}/{pages}) — total {total}:", ""]
+    for i, a in enumerate(subset, start=start+1):
+        name = a.get("name") or a.get("slug","(no-name)")
+        src  = a.get("source","-")
+        st   = a.get("status","")
+        tail = f" [{st}]" if st else ""
+        lines.append(f"{i}. {name} — {src}{tail}")
+    lines.append("\n• Cari detail: `/airdrops <keyword>` atau `/tugas <keyword>`")
+    return "\n".join(lines)
+
+def page_kb(current: int, total_items: int, page_size: int = PAGE_SIZE) -> InlineKeyboardMarkup:
+    pages = max(1, (total_items + page_size - 1)//page_size)
+    prev_p = max(1, current-1)
+    next_p = min(pages, current+1)
+    buttons = []
+    if pages > 1:
+        buttons.append([
+            InlineKeyboardButton("⬅️ Prev", callback_data=f"airpage:{prev_p}"),
+            InlineKeyboardButton(f"{current}/{pages}", callback_data="airpage:noop"),
+            InlineKeyboardButton("Next ➡️", callback_data=f"airpage:{next_p}"),
+        ])
+    return InlineKeyboardMarkup(buttons) if buttons else InlineKeyboardMarkup([])
+
+# =====================
+# Handlers (Commands)
 # =====================
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -288,9 +294,9 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Selamat datang di *AirdropCore Bot*!\n"
         "• `btc usd`, `0.1 eth idr`\n"
         "• /price <coin> [fiat], /convert <amt> <coin> <fiat>\n"
-        "• /airdrops [keyword], /airupdate (refresh)\n"
+        "• /airdrops, /airdrops list|all, /tugas <keyword>, /airupdate\n"
         "• /ask <pertanyaan> (AI)",
-        parse_mode="Markdown",
+        parse_mode=ParseMode.MARKDOWN,
         reply_markup=main_menu()
     )
 
@@ -299,8 +305,11 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Perintah:\n"
         "• /price <coin> [fiat]\n"
         "• /convert <amt> <coin> <fiat>\n"
-        "• /airdrops [keyword]\n"
-        "• /airupdate  (paksa refresh scraper)\n"
+        "• /airdrops  (Top 15 dgn pagination)\n"
+        "• /airdrops list  (50 item) | /airdrops all (100 item)\n"
+        "• /tugas <keyword>  (ringkas tugas dari halaman sumber)\n"
+        "• /airupdate  (scrape + update cache + tampil Top 20)\n"
+        "• /airreload  (reload cache dari file)\n"
         "• /ask <pertanyaan>\n"
         f"FIAT default: {FIAT_DEFAULT.upper()}",
         disable_web_page_preview=True
@@ -313,10 +322,10 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data == "menu_convert":
         txt = "Contoh:\n• `/convert 0.25 eth idr`\n• `0.25 eth idr`"
     elif data == "menu_air":
-        txt = ("Airdrop:\n• `/airdrops`\n• `/airdrops monad`\n• `/airupdate` untuk refresh")
+        txt = "• `/airdrops` untuk daftar + tombol Next/Prev\n• `/tugas <keyword>` untuk lihat tugas"
     else:
         txt = "AI: `/ask <pertanyaan>`"
-    await q.edit_message_text(txt, parse_mode="Markdown")
+    await q.edit_message_text(txt, parse_mode=ParseMode.MARKDOWN)
 
 # ----- Harga & konversi -----
 async def reply_price(update: Update, sym: str, fiat: str, amount: float=1.0):
@@ -354,37 +363,120 @@ async def convert_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sym, fiat = ctx.args[1], ctx.args[2].lower()
     await reply_price(update, sym, fiat, amt)
 
-# ----- Airdrop -----
+# ----- Airdrops: list/search/detail -----
+def airdrop_match(q: str, a: dict) -> bool:
+    q = q.lower().strip()
+    hay = " ".join([a.get("slug",""), a.get("name",""), a.get("status",""), a.get("source","")]).lower()
+    return all(part in hay for part in q.split())
+
 async def airdrops_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = " ".join(ctx.args).strip().lower()
-    items = scrape_all(force=False)
-    if not q:
-        lines = [f"• {a.name} — {a.status or a.source}" for a in items[:15]]
-        await update.message.reply_text(
-            "Airdrop terdeteksi (Top 15):\n" + "\n".join(lines) + "\n\nGunakan `/airdrops <keyword>` untuk detail.",
-            parse_mode="Markdown", disable_web_page_preview=True
-        )
+    items = AIRDROPS or load_airdrops_from_cache()
+
+    if q in {"list", "all"}:
+        limit = 50 if q == "list" else 100
+        text = format_airdrop_list(items[:limit], page=1, page_size=limit)
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
         return
-    a = fuzzy_find(items, q)
-    if not a:
+
+    if not q:
+        # halaman 1 + tombol
+        total = len(items)
+        text = format_airdrop_list(items, page=1, page_size=PAGE_SIZE)
+        kb = page_kb(1, total, PAGE_SIZE)
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb, disable_web_page_preview=True)
+        return
+
+    # cari
+    hits = [a for a in items if airdrop_match(q, a)]
+    if not hits:
         await update.message.reply_text(f"❌ Tidak ditemukan untuk '{q}'."); return
-    txt = (f"🎁 *{a.name}*\n"
-           f"🌐 Chain: {a.chain or '-'}\n"
-           f"💰 Reward: {a.reward or '-'}\n"
-           f"📊 Status: {a.status or '-'}\n"
-           f"🔗 Sumber: {a.source}\n\n")
-    if a.tasks:
-        txt += "*Task:*\n" + "\n".join([f"• {html.escape(t)}" for t in a.tasks[:10]])
-    else:
-        txt += "_Task belum terdeteksi otomatis; buka link untuk detail._"
-    await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Buka halaman", url=a.link)]]
-    ), parse_mode="Markdown", disable_web_page_preview=False)
+    k = min(30, len(hits))
+    lines = [f"Hasil untuk '{q}' ({k}/{len(hits)}):", ""]
+    for i, a in enumerate(hits[:k], start=1):
+        name = a.get("name") or a.get("slug","(no-name)")
+        src  = a.get("source","-")
+        st   = a.get("status","")
+        tail = f" [{st}]" if st else ""
+        lines.append(f"{i}. {name} — {src}{tail}")
+    lines.append("\nTambah kata `detail` dengan /tugas untuk lihat misinya.")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+
+# Pagination callback
+async def airpage_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; data = q.data or ""
+    if not data.startswith("airpage:"):
+        await q.answer(); return
+    _, val = data.split(":", 1)
+    if val == "noop":
+        await q.answer(); return
+    try:
+        page = int(val)
+    except:
+        page = 1
+    items = AIRDROPS or load_airdrops_from_cache()
+    text = format_airdrop_list(items, page=page, page_size=PAGE_SIZE)
+    kb = page_kb(page, len(items), PAGE_SIZE)
+    await q.answer()
+    await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb, disable_web_page_preview=True)
+
+# ----- Tugas (ambil dari URL sumber + ringkas AI) -----
+async def tugas_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("Format: /tugas <keyword>\ncontoh: /tugas monad")
+        return
+    key = " ".join(ctx.args).lower()
+    items = AIRDROPS or load_airdrops_from_cache()
+    hits = [a for a in items if airdrop_match(key, a)]
+    if not hits:
+        await update.message.reply_text(f"❌ Airdrop '{key}' tidak ditemukan. Coba `/airdrops {key}` dulu.")
+        return
+    a = hits[0]
+    url = a.get("url")
+    name = a.get("name") or a.get("slug","(no-name)")
+    await update.message.reply_text(f"🔎 Mengambil tugas untuk *{name}*…", parse_mode=ParseMode.MARKDOWN)
+    steps = scrape_tasks(url) if url else ["URL sumber tidak tersedia."]
+    await update.message.reply_text(
+        "📋 Tugas terdeteksi:\n" + "\n".join(f"• {s}" for s in steps),
+        disable_web_page_preview=True
+    )
+
+# ----- Airupdate & Airreload -----
+async def airreload_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    load_airdrops_from_cache()
+    await update.message.reply_text(f"♻️ Cache dimuat. Total airdrop: {len(AIRDROPS)}")
+
+def format_airdrop_preview(items: List[dict], limit: int = 20) -> str:
+    if not items: return "Belum ada data airdrop."
+    lines = [f"Daftar Airdrop Terbaru (Top {min(limit, len(items))}/{len(items)}):", ""]
+    for i, a in enumerate(items[:limit], start=1):
+        name = a.get("name") or a.get("slug","(no-name)")
+        src  = a.get("source","-")
+        st   = a.get("status","")
+        tail = f" [{st}]" if st else ""
+        lines.append(f"{i}. {name} — {src}{tail}")
+    lines.append("\nCari detail: `/airdrops <keyword>` atau `/tugas <keyword>`")
+    return "\n".join(lines)
 
 async def airupdate_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔄 Memperbarui daftar airdrop…")
-    items = scrape_all(force=True)
-    await update.message.reply_text(f"✅ Selesai. Total item: {len(items)}")
+    msg = await update.message.reply_text("🔄 Update airdrop… mohon tunggu (±10–30s)")
+    loop = ctx.application._application_loop
+    try:
+        new_items: List[dict] = await loop.run_in_executor(executor, scrape_all_sources)
+        if not new_items:
+            await msg.edit_text("⚠️ Tidak ada data baru dari sumber."); return
+        save_airdrops_to_cache(new_items)
+        # refresh memori
+        global AIRDROPS
+        AIRDROPS = new_items
+        # tampilkan daftar 20 besar langsung + tombol pagination
+        preview_text = format_airdrop_preview(AIRDROPS, limit=20)
+        kb = page_kb(1, len(AIRDROPS), PAGE_SIZE)
+        await msg.edit_text("✅ Update selesai.\n" + preview_text, parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=kb, disable_web_page_preview=True)
+    except Exception as e:
+        log.exception("airupdate error")
+        await msg.edit_text(f"❌ Gagal update: {e}")
 
 # ----- AI -----
 async def ask_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -405,7 +497,7 @@ async def ask_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.exception("AI error")
         await update.message.reply_text(f"❌ Error AI: {e}")
 
-# ----- Router teks bebas -----
+# ----- Router teks bebas (harga/convert/airdrop/AI) -----
 async def text_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t = (update.message.text or "").strip()
 
@@ -429,18 +521,22 @@ async def text_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # keyword airdrop di teks bebas
     if "airdrop" in t.lower():
-        items = scrape_all(False)
+        items = AIRDROPS or load_airdrops_from_cache()
         key = t.lower().replace("airdrop","").strip()
         if key:
-            a = fuzzy_find(items, key)
-            if a:
-                txt = (f"🎁 {a.name}\nChain: {a.chain or '-'} | Reward: {a.reward or '-'}\n"
-                       f"Status: {a.status or a.source}\nLink: {a.link}")
-                await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("Buka halaman", url=a.link)]]
-                ))
-                return
-        await update.message.reply_text("Gunakan `/airdrops <keyword>` untuk detail.", parse_mode="Markdown"); return
+            hits = [a for a in items if airdrop_match(key, a)]
+            if hits:
+                a = hits[0]
+                name = a.get("name") or a.get("slug","(no-name)")
+                url = a.get("url","")
+                await update.message.reply_text(
+                    f"🎁 {name}\nSumber: {a.get('source','-')}\nLink: {url}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Buka halaman", url=url)]])
+                ); return
+        # kalau tidak ada keyword → tampilkan halaman 1 list
+        text = format_airdrop_list(items, page=1, page_size=PAGE_SIZE)
+        kb = page_kb(1, len(items), PAGE_SIZE)
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb); return
 
     # fallback ke AI
     if client:
@@ -455,14 +551,17 @@ async def text_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.warning("AI fallback error: %s", e)
 
-    await update.message.reply_text("Tidak paham. Coba: `btc usd`, `0.1 eth idr`, atau `/airdrops`.", parse_mode="Markdown")
+    await update.message.reply_text("Tidak paham. Coba: `btc usd`, `0.1 eth idr`, atau `/airdrops`.", parse_mode=ParseMode.MARKDOWN)
 
-# =====================
+    # =====================
 # Main
 # =====================
 def main():
     if not BOT_TOKEN:
         raise SystemExit("❌ BOT_TOKEN belum diisi di .env")
+
+    # muat cache awal (kalau ada)
+    load_airdrops_from_cache()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     # Commands
@@ -471,10 +570,13 @@ def main():
     app.add_handler(CommandHandler("price", price_cmd))
     app.add_handler(CommandHandler("convert", convert_cmd))
     app.add_handler(CommandHandler("airdrops", airdrops_cmd))
+    app.add_handler(CommandHandler("tugas", tugas_cmd))
     app.add_handler(CommandHandler("airupdate", airupdate_cmd))
+    app.add_handler(CommandHandler("airreload", airreload_cmd))
     app.add_handler(CommandHandler("ask", ask_cmd))
-    # Menu
-    app.add_handler(CallbackQueryHandler(menu_cb))
+    # Menu & pagination
+    app.add_handler(CallbackQueryHandler(menu_cb, pattern=r"^menu_"))
+    app.add_handler(CallbackQueryHandler(airpage_cb, pattern=r"^airpage:"))
     # Text
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
