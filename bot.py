@@ -16,9 +16,8 @@ from dataclasses import dataclass, asdict
 import httpx
 from bs4 import BeautifulSoup
 
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatAction
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatAction)
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
