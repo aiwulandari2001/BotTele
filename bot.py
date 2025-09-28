@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+AirdropCore Telegram Bot (final)
+- Crypto: /price, /prices, /convert, natural text ("btc usd", "0.25 eth idr", "btc")
+- Airdrop: /airupdate [pages] [force], /airdrops (pagination), /tugas <keyword>,
+           /airnews (yang baru), /airstatus, /airdebug, /airclear
+- AI: tanpa /ask (ngetik biasa), /ask tetap tersedia (opsional)
+"""
 
-import os, re, json, pathlib, logging, asyncio, socket
-from typing import List, Dict, Optional
+import os, re, json, pathlib, logging, asyncio, socket, random, time
+from typing import List, Dict, Optional, Set
 from dataclasses import dataclass, field, asdict
 from urllib.parse import urljoin
 from datetime import datetime, timedelta
@@ -25,11 +32,11 @@ try:
 except Exception:
     pass
 
-BOT_TOKEN        = os.getenv("BOT_TOKEN", "").strip()
-OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "").strip()  # opsional
-FIAT_DEFAULT     = os.getenv("FIAT_DEFAULT", "usd").lower()
+BOT_TOKEN         = os.getenv("BOT_TOKEN", "").strip()
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "").strip()  # opsional
+FIAT_DEFAULT      = os.getenv("FIAT_DEFAULT", "usd").lower()
 AIR_REFRESH_HOURS = int(os.getenv("AIR_REFRESH_HOURS", "6"))
-AIR_CACHE        = os.getenv("AIR_CACHE", "airdrops_cache.json")
+AIR_CACHE         = os.getenv("AIR_CACHE", "airdrops_cache.json")
 
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN belum diisi. Set di .env atau environment variable.")
@@ -125,11 +132,29 @@ class Airdrop:
     url: str = ""
     source: str = ""
     tasks: List[str] = field(default_factory=list)
+    # tracking
+    created_at: float = field(default_factory=lambda: datetime.utcnow().timestamp())
+    updated_at: float = field(default_factory=lambda: datetime.utcnow().timestamp())
 
 AIRDROPS: List[Airdrop] = []
 LAST_AIR_UPDATE: Optional[datetime] = None
+NEW_SLUGS: Set[str] = set()
 
-UA = {"User-Agent": "Mozilla/5.0 (compatible; AirdropCoreBot/2.2)"}
+# Rotating UA
+UAS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; rv:123.0) Gecko/20100101 Firefox/123.0",
+]
+def rand_headers():
+    return {
+        "User-Agent": random.choice(UAS),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "DNT": "1",
+    }
 
 def _clean_text(s: Optional[str]) -> str:
     if not s: return ""
@@ -158,7 +183,7 @@ def scrape_airdrops_io(max_pages: int = 1) -> List[Airdrop]:
 
     out: List[Airdrop] = []
     for url in urls:
-        r = requests.get(url, headers=UA, timeout=30); r.raise_for_status()
+        r = requests.get(url, headers=rand_headers(), timeout=30); r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         for card in soup.select(".airdrops-list .item, article, .card"):
             title_el = card.select_one(".title, h3, h2, a[title]") or card.select_one("a")
@@ -185,7 +210,7 @@ def scrape_airdropking(max_pages: int = 1) -> List[Airdrop]:
     urls = [f"{base}/airdrops/"]
     out: List[Airdrop] = []
     for url in urls[:max_pages]:
-        r = requests.get(url, headers=UA, timeout=30); r.raise_for_status()
+        r = requests.get(url, headers=rand_headers(), timeout=30); r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         for row in soup.select("article, .airdrop-card, .card"):
             title_el = row.select_one("h2, h3, .title, a[title]") or row.select_one("a")
@@ -212,7 +237,7 @@ def scrape_cryptorank(max_pages: int = 1) -> List[Airdrop]:
     urls = [f"{base}/drophunting"]
     out: List[Airdrop] = []
     for url in urls[:max_pages]:
-        r = requests.get(url, headers=UA, timeout=30); r.raise_for_status()
+        r = requests.get(url, headers=rand_headers(), timeout=30); r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         rows = soup.select("a[href*='/ico/'], a[href*='/airdrops/'], a[href*='/project/']")
         seen_links = set()
@@ -249,7 +274,7 @@ def scrape_coingecko_airdrops(max_pages: int = 1) -> List[Airdrop]:
     urls = [f"{base}/airdrops"]
     out: List[Airdrop] = []
     for url in urls[:max_pages]:
-        r = requests.get(url, headers=UA, timeout=30); r.raise_for_status()
+        r = requests.get(url, headers=rand_headers(), timeout=30); r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         cards = soup.select("a[href*='/airdrops/'], tr a[href*='/coins/'], .tw-card a")
         seen = set()
@@ -279,9 +304,11 @@ def scrape_coingecko_airdrops(max_pages: int = 1) -> List[Airdrop]:
                                url=full, source="coingecko"))
     return out
 
-# ===================== Aggregator + Dedup =====================
-def scrape_airdrops_sync(max_pages: int = 1) -> List[Airdrop]:
+# ===================== Aggregator (return list+stats) =====================
+def scrape_airdrops_sync(max_pages: int = 1):
     results: List[Airdrop] = []
+    stats = []
+
     for fn, label in [
         (scrape_airdrops_io, "airdrops.io"),
         (scrape_airdropking, "airdropking.io"),
@@ -289,10 +316,13 @@ def scrape_airdrops_sync(max_pages: int = 1) -> List[Airdrop]:
         (scrape_coingecko_airdrops, "coingecko"),
     ]:
         try:
+            before = len(results)
             results.extend(fn(max_pages=max_pages))
+            stats.append((label, len(results) - before, "OK"))
         except Exception as e:
-            log.warning("%s gagal: %s", label, e)
+            stats.append((label, 0, f"{type(e).__name__}: {e}"))
 
+    # dedup sementara
     uniq: Dict[str, Airdrop] = {}
     for a in results:
         if a.slug not in uniq:
@@ -301,20 +331,12 @@ def scrape_airdrops_sync(max_pages: int = 1) -> List[Airdrop]:
             if (a.reward and not uniq[a.slug].reward) or (a.chain and not uniq[a.slug].chain):
                 uniq[a.slug] = a
 
-    final_list = list(uniq.values())
-    if not final_list:
-        final_list = [Airdrop(
-            slug="example-airdrop", name="Example Airdrop",
-            reward="100 TEST", chain="ETH",
-            url="https://example.com", source="fallback",
-            tasks=["Join Telegram", "Follow X", "Claim in app"]
-        )]
-    return final_list
+    return list(uniq.values()), stats
 
 # ===================== Enrich detail (tasks + tombol) =====================
 def enrich_airdrop_details(a: Airdrop) -> Airdrop:
     try:
-        r = requests.get(a.url, headers=UA, timeout=30); r.raise_for_status()
+        r = requests.get(a.url, headers=rand_headers(), timeout=30); r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
 
         tasks: List[str] = []
@@ -359,8 +381,12 @@ def enrich_airdrop_details(a: Airdrop) -> Airdrop:
 # ===================== Cache helpers =====================
 def save_cache():
     try:
-        with open(AIR_CACHE, "w", encoding="utf-8") as f:
+        tmp = AIR_CACHE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump([asdict(a) for a in AIRDROPS], f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, AIR_CACHE)
     except Exception as e:
         log.warning("save_cache gagal: %s", e)
 
@@ -371,10 +397,27 @@ def load_cache():
             data = json.load(open(p, "r", encoding="utf-8"))
             AIRDROPS.clear()
             for d in data:
+                # kompatibel jika cache lama belum punya created_at/updated_at
+                if "created_at" not in d: d["created_at"] = datetime.utcnow().timestamp()
+                if "updated_at" not in d: d["updated_at"] = d["created_at"]
                 AIRDROPS.append(Airdrop(**d))
             log.info("Cache dimuat: %d airdrops", len(AIRDROPS))
     except Exception as e:
         log.warning("load_cache gagal: %s", e)
+
+# ===================== Debug konektivitas =====================
+AIR_DEBUG_HOSTS = [
+    ("airdrops.io", "https://airdrops.io/latest/"),
+    ("airdropking.io", "https://airdropking.io/airdrops/"),
+    ("cryptorank.io", "https://cryptorank.io/drophunting"),
+    ("coingecko.com", "https://www.coingecko.com/airdrops"),
+]
+def _http_head(url: str, timeout=12):
+    try:
+        r = requests.get(url, headers=rand_headers(), timeout=timeout)
+        return r.status_code, len(r.text)
+    except Exception as e:
+        return f"ERR: {type(e).__name__}", 0
 
 # ===================== Pagination util =====================
 def _paged(items: List[Airdrop], page: int, per_page: int = 5) -> List[Airdrop]:
@@ -391,6 +434,13 @@ def _air_kb(page: int, total: int, per_page: int = 5):
         btns = [InlineKeyboardButton("🔄 Refresh", callback_data="air_refresh:1")]
     return InlineKeyboardMarkup([btns])
 
+def _air_list_text(items: List[Airdrop]) -> str:
+    lines = ["📋 Airdrop terdeteksi:\n"]
+    for a in items:
+        is_new = " [NEW]" if a.slug in NEW_SLUGS else ""
+        lines.append(f"• <b>{a.name}</b>{is_new} — {a.reward or '-'} ({a.chain or '-'})\n  {a.url}")
+    return "\n".join(lines)
+
 # ===================== Commands: start/help =====================
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = [
@@ -401,10 +451,11 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text(
         "Selamat datang di AirdropCore Bot!\n\n"
-        "• Ketik bebas: `btc usd`, `0.25 eth idr`\n"
+        "• Ketik bebas: `btc usd`, `0.25 eth idr` (AI juga tanpa /ask)\n"
         "• /price <coin> [fiat]\n• /prices btc,eth idr\n• /convert 123 sol usd\n"
         "• /setfiat idr|usd|usdt|eur\n"
-        "• /airupdate, /airdrops, /tugas <keyword>, /airstatus\n",
+        "• /airupdate [pages] [force], /airdrops, /tugas <keyword>\n"
+        "• /airnews, /airstatus, /airdebug, /airclear\n",
         reply_markup=InlineKeyboardMarkup(kb),
         parse_mode="Markdown",
     )
@@ -429,17 +480,21 @@ async def setfiat_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ FIAT diset ke {fiat.upper()}")
 
 async def ask_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not client:
-        await update.message.reply_text("❌ Fitur AI belum aktif (OPENAI_API_KEY kosong).")
+    # opsional: /ask <pertanyaan>
+    return await ai_answer(update, " ".join(ctx.args).strip())
+
+async def ai_answer(update: Update, text: str):
+    if not text:
+        await update.message.reply_text("Tulis pertanyaanmu.")
         return
-    prompt = " ".join(ctx.args).strip()
-    if not prompt:
-        await update.message.reply_text("Format: /ask <pertanyaan>")
+    if not client:
+        # tanpa AI, diamkan agar router lain bisa jawab
+        await update.message.reply_text("❌ Fitur AI belum aktif (OPENAI_API_KEY kosong).")
         return
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role":"user","content": prompt}],
+            messages=[{"role":"user","content": text}],
             max_tokens=400, temperature=0.5
         )
         answer = resp.choices[0].message.content.strip()
@@ -522,36 +577,96 @@ async def convert_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chg = data[cid].get(f"{fiat}_24h_change")
     chg_txt = f" (24h: {chg:+.2f}%)" if isinstance(chg,(int,float)) else ""
     await update.message.reply_text(f"{amount:g} {sym.upper()} ≈ {fmt_price(total, fiat)}{chg_txt}")
-    # ===================== Commands: Airdrop =====================
+
+# ===================== Commands: Airdrop =====================
 async def airupdate_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔄 Sedang update daftar airdrops…")
+    # /airupdate [pages] [force]
+    pages = 1
+    force = False
+    if ctx.args:
+        for arg in ctx.args:
+            if arg.isdigit():
+                pages = max(1, min(5, int(arg)))
+            elif arg.lower() == "force":
+                force = True
+
+    await update.message.reply_text(f"🔄 Update airdrops (pages={pages}, force={force})…")
     loop = asyncio.get_running_loop()
     try:
-        new_list = await loop.run_in_executor(None, scrape_airdrops_sync, 1)
+        fresh_list, stats = await loop.run_in_executor(None, scrape_airdrops_sync, pages)
+
+        # --- MERGE ke cache lama, bukan overwrite mentah ---
+        old_by_slug: Dict[str, Airdrop] = {a.slug: a for a in AIRDROPS}
+        global NEW_SLUGS
+        NEW_SLUGS = set()
+
+        merged: Dict[str, Airdrop] = {}
+        for a in fresh_list:
+            if a.slug in old_by_slug:
+                prev = old_by_slug[a.slug]
+                a.created_at = prev.created_at
+                a.updated_at = datetime.utcnow().timestamp()
+                if not a.reward and prev.reward: a.reward = prev.reward
+                if not a.chain  and prev.chain:  a.chain  = prev.chain
+            else:
+                NEW_SLUGS.add(a.slug)
+                a.created_at = datetime.utcnow().timestamp()
+                a.updated_at = a.created_at
+            merged[a.slug] = a
+
+        prev_cnt = len(AIRDROPS)
+        new_cnt  = len(merged)
+        threshold = max(3, int(prev_cnt * 0.40))  # minimal 40% dari cache lama
+        if not force and prev_cnt > 0 and new_cnt < threshold:
+            await update.message.reply_text(
+                f"⚠️ Hasil baru terlalu sedikit ({new_cnt}) < threshold {threshold}. Cache lama dipertahankan.\n"
+                f"Jalankan '/airupdate {pages} force' untuk menimpa."
+            )
+            return
+
+        # commit & sort terbaru dulu
         AIRDROPS.clear()
-        AIRDROPS.extend(new_list)
+        AIRDROPS.extend(merged.values())
+        AIRDROPS.sort(key=lambda x: (x.created_at, x.updated_at), reverse=True)
+
         global LAST_AIR_UPDATE
         LAST_AIR_UPDATE = datetime.utcnow()
         save_cache()
-        await update.message.reply_text(f"✅ Scraper selesai. Terkumpul {len(AIRDROPS)} airdrop.\nKetik /airdrops untuk melihat daftar.")
+
+        rep = [f"✅ Selesai. Terkumpul {len(AIRDROPS)} airdrop."]
+        if NEW_SLUGS:
+            rep.append(f"🆕 Baru: {len(NEW_SLUGS)}")
+        rep.append("<b>Per sumber</b>:")
+        for label, count, note in stats:
+            rep.append(f"• {label}: +{count}" if count > 0 else f"• {label}: 0 ({note})")
+        rep.append("\n/airdrops untuk daftar, /airnews untuk yang baru.")
+        await update.message.reply_html("\n".join(rep))
+
     except Exception as e:
         await update.message.reply_text(f"❌ Gagal update: {e}")
-
-def _air_list_text(items: List[Airdrop]) -> str:
-    lines = ["📋 Airdrop terdeteksi:\n"]
-    for a in items:
-        lines.append(f"• <b>{a.name}</b> — {a.reward or '-'} ({a.chain or '-'})\n  {a.url}")
-    return "\n".join(lines)
 
 async def airdrops_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not AIRDROPS:
         await update.message.reply_text("⚠️ Belum ada data. Kirim /airupdate untuk mengisi daftar.")
         return
+    AIRDROPS.sort(key=lambda x: (x.created_at, x.updated_at), reverse=True)
     page = 1
     per_page = 5
     chunk = _paged(AIRDROPS, page, per_page)
     txt = _air_list_text(chunk)
     await update.message.reply_html(txt, reply_markup=_air_kb(page, len(AIRDROPS), per_page))
+
+async def airnews_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not AIRDROPS:
+        await update.message.reply_text("⚠️ Belum ada data. Jalankan /airupdate dulu.")
+        return
+    news = [a for a in AIRDROPS if a.slug in NEW_SLUGS]
+    if not news:
+        await update.message.reply_text("Tidak ada item baru sejak update terakhir.")
+        return
+    news.sort(key=lambda x: x.created_at, reverse=True)
+    subset = news[:10]
+    await update.message.reply_html(_air_list_text(subset))
 
 async def tugas_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
@@ -580,47 +695,35 @@ async def tugas_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb
     )
 
-async def air_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    data = q.data or ""
-    if data.startswith(("air_prev", "air_next", "air_refresh")):
-        try:
-            page = int(data.split(":")[1])
-        except Exception:
-            page = 1
-        per_page = 5
-        if not AIRDROPS:
-            await q.edit_message_text("⚠️ Belum ada data. Kirim /airupdate untuk mengisi daftar.")
-            return
-        chunk = _paged(AIRDROPS, page, per_page)
-        txt = _air_list_text(chunk)
-        await q.edit_message_text(text=txt, reply_markup=_air_kb(page, len(AIRDROPS), per_page), parse_mode="HTML")
-        
-# ===================== Auto-refresh (JobQueue) =====================
-async def job_airupdate(context):
-    """Auto-refresh daftar airdrop berkala."""
-    loop = asyncio.get_running_loop()
-    try:
-        new_list = await loop.run_in_executor(None, scrape_airdrops_sync, 1)
-        AIRDROPS.clear()
-        AIRDROPS.extend(new_list)
-        global LAST_AIR_UPDATE
-        LAST_AIR_UPDATE = datetime.utcnow()
-        save_cache()
-        log.info("Auto-refresh OK: %d airdrops", len(AIRDROPS))
-    except Exception as e:
-        log.warning("Auto-refresh gagal: %s", e)
-
 async def airstatus_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not AIRDROPS:
-        await update.message.reply_text("Belum ada data. Jalankan /airupdate atau tunggu auto-refresh.")
-        return
     ts = LAST_AIR_UPDATE.isoformat(timespec="seconds") + "Z" if LAST_AIR_UPDATE else "-"
     await update.message.reply_text(
         f"📡 Airdrop cached: {len(AIRDROPS)}\n"
         f"⏱️ Last update (UTC): {ts}\n"
         f"⏲️ Interval: {AIR_REFRESH_HOURS} jam"
     )
+
+async def airdebug_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    lines = ["🔎 <b>AirDebug</b>"]
+    for host, url in AIR_DEBUG_HOSTS:
+        dns_ok = _dns_ok(host)
+        status, size = _http_head(url, timeout=15) if dns_ok else ("DNS_FAIL", 0)
+        lines.append(f"• {host}: DNS={'OK' if dns_ok else 'FAIL'} | HTTP={status} | size={size}")
+    lines.append(f"\nCache items: {len(AIRDROPS)}")
+    lines.append(f"Last update: {LAST_AIR_UPDATE.isoformat(timespec='seconds')+'Z' if LAST_AIR_UPDATE else '-'}")
+    await update.message.reply_html("\n".join(lines))
+
+async def airclear_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global LAST_AIR_UPDATE, NEW_SLUGS
+    AIRDROPS.clear()
+    NEW_SLUGS = set()
+    LAST_AIR_UPDATE = None
+    try:
+        p = pathlib.Path(AIR_CACHE)
+        if p.exists(): p.unlink()
+    except Exception as e:
+        log.warning("hapus cache gagal: %s", e)
+    await update.message.reply_text("🧹 Cache airdrop dihapus. Jalankan /airupdate untuk isi ulang.")
 
 # ===================== Menu & Text Router =====================
 async def on_menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -632,12 +735,12 @@ async def on_menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         txt = ("Convert:\n• /convert <amount> <coin> <fiat>\n"
                "• Contoh: /convert 0.1 btc idr")
     elif data == "menu_air":
-        txt = ("Airdrop:\n• /airupdate (update daftar)\n"
-               "• /airdrops (daftar + tombol Next/Prev)\n"
+        txt = ("Airdrop:\n• /airupdate [pages] [force]\n"
+               "• /airdrops (list + Next/Prev)\n"
                "• /tugas <keyword> (detail + tombol link)\n"
-               "• /airstatus (status cache & jadwal)")
+               "• /airnews (yang baru), /airstatus, /airdebug, /airclear")
     elif data == "menu_ai":
-        txt = "AI Chat: /ask <pertanyaan>"
+        txt = "AI: ketik pertanyaan langsung (tanpa /ask)."
     else:
         txt = "Pilih menu di bawah ini."
     await q.edit_message_text(txt)
@@ -670,22 +773,42 @@ async def text_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         fiat = get_chat_fiat(update.effective_chat.id)
         return await reply_price(update, sym, fiat)
 
-    # 4) fallback AI
+    # 4) fallback AI (tanpa /ask)
     if client:
-        try:
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role":"user","content": text}],
-                max_tokens=300, temperature=0.6
-            )
-            answer = resp.choices[0].message.content.strip()
-            await update.message.reply_text(answer)
-            return
-        except Exception as e:
-            log.warning("AI fallback error: %s", e)
+        return await ai_answer(update, text)
 
     await update.message.reply_text("Perintah tidak dikenali. Ketik /help.")
-    
+
+# ===================== Auto-refresh (JobQueue) =====================
+async def job_airupdate(context):
+    log.info("JobQueue: mulai auto-refresh…")
+    loop = asyncio.get_running_loop()
+    try:
+        fresh_list, _stats = await loop.run_in_executor(None, scrape_airdrops_sync, 1)
+
+        # merge ringan tanpa NEW_SLUGS (job periodik)
+        old_by_slug: Dict[str, Airdrop] = {a.slug: a for a in AIRDROPS}
+        merged: Dict[str, Airdrop] = {}
+        for a in fresh_list:
+            if a.slug in old_by_slug:
+                prev = old_by_slug[a.slug]
+                a.created_at = prev.created_at
+                a.updated_at = datetime.utcnow().timestamp()
+                if not a.reward and prev.reward: a.reward = prev.reward
+                if not a.chain  and prev.chain:  a.chain  = prev.chain
+            merged[a.slug] = a
+        if merged:
+            AIRDROPS.clear()
+            AIRDROPS.extend(merged.values())
+            AIRDROPS.sort(key=lambda x: (x.created_at, x.updated_at), reverse=True)
+
+        global LAST_AIR_UPDATE
+        LAST_AIR_UPDATE = datetime.utcnow()
+        save_cache()
+        log.info("Auto-refresh OK: %d airdrops", len(AIRDROPS))
+    except Exception as e:
+        log.warning("Auto-refresh gagal: %s", e)
+
 # ===================== Runner =====================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -706,10 +829,11 @@ def main():
     app.add_handler(CommandHandler("airdrops", airdrops_cmd))
     app.add_handler(CommandHandler("tugas", tugas_cmd))
     app.add_handler(CommandHandler("airstatus", airstatus_cmd))
-    app.add_handler(CallbackQueryHandler(air_cb, pattern=r"^air_(prev|next|refresh):"))
-
-    # menu & teks bebas
+    app.add_handler(CommandHandler("airdebug", airdebug_cmd))
+    app.add_handler(CommandHandler("airclear", airclear_cmd))
+    app.add_handler(CommandHandler("airnews", airnews_cmd))
     app.add_handler(CallbackQueryHandler(on_menu_cb))
+    app.add_handler(CallbackQueryHandler(lambda u, c: None, pattern=r"^air_(prev|next|refresh):"))  # keep pattern reserved
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
     # schedule auto-refresh (mulai 10 detik, lalu tiap AIR_REFRESH_HOURS jam)
