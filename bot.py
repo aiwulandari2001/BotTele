@@ -1,137 +1,94 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+AirdropCore (Ultra Pro) — Telegram Bot
+Fiturnya:
+- Harga/konversi ribuan kripto (CoinGecko) + TTL cache
+- AI bebas tanpa /ask (fallback), sistem prompt “pro”
+- Scraper airdrop multi-sumber + daftar paging + detail tugas
+- Hemat VPS: jika pair tak valid → tidak balas
+Python 3.8+ compatible.
+"""
 
-import os, re, time, math, json, asyncio, logging, html
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+import os, re, json, time, asyncio, logging, math, html
+from typing import Optional, List, Dict, Any, Tuple
+from dataclasses import dataclass, asdict
 
-import aiohttp
-from aiohttp import ClientSession, ClientTimeout, TCPConnector
+import httpx
 from bs4 import BeautifulSoup
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatAction
 )
 from telegram.ext import (
-    ApplicationBuilder, ContextTypes, CommandHandler,
-    MessageHandler, CallbackQueryHandler, filters
+    ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
 )
 
-# ========== CONFIG ==========
+# ========== Konfigurasi dasar ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()  # opsi
+
+BRAND = "AirdropCore"
 FIAT_DEFAULT = os.getenv("FIAT_DEFAULT", "usd").lower()
 
+DATA_DIR = os.getenv("DATA_DIR", "data")
+COINMAP_FILE = os.path.join(DATA_DIR, "coins.json")
+AIRDROPS_FILE = os.path.join(DATA_DIR, "airdrops.json")
+
+COINGECKO = "https://api.coingecko.com/api/v3"
+HTTP_TIMEOUT = 20
+PRICE_TTL = 60          # detik
+COINMAP_TTL = 6 * 3600  # 6 jam
+
+# Sumber scraper yang aman (hindari domain yg sering 403/DNS)
+SCRAPE_SOURCES = ("airdrops.io", "airdropalert.com", "airdrops.fun")
+
+# ========== Logging ==========
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
-log = logging.getLogger("ultra_pro.bot")
+log = logging.getLogger("airdropcore.bot")
+
+# ========== Klien HTTP Async global ==========
+HTTP: Optional[httpx.AsyncClient] = None
 
 # ========== OpenAI (opsional) ==========
-_openai = None
-if OPENAI_API_KEY:
-    try:
-        from openai import OpenAI
-        _openai = OpenAI(api_key=OPENAI_API_KEY)
+try:
+    from openai import OpenAI
+    OAI: Optional[OpenAI] = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+    if OAI:
         log.info("OpenAI aktif")
-    except Exception as e:
-        log.warning("OpenAI init gagal: %s", e)
+except Exception as e:
+    OAI = None
+    log.warning("OpenAI tidak tersedia: %s", e)
 
-# ========== HTTP SESSION ==========
-from typing import Optional
-HTTP: Optional[ClientSession] = None
-UA = {
-    "User-Agent": "Mozilla/5.0 (AirdropCoreUltraPro/1.0; +https://t.me/) ",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9,id;q=0.7",
-    "Connection": "keep-alive",
-    "Referer": "https://www.google.com/",
-}
+AI_SYSTEM = (
+    f"Kamu adalah asisten kripto & airdrop super profesional untuk {BRAND}. "
+    "Jawablah singkat-padat, gunakan poin/emoji seperlunya, sebutkan sumber jika relevan. "
+    "Jika ditanya harga/konversi, cukup beri angka & ringkas. Jika diminta rangkum, ringkas elegan."
+)
 
-async def http_get(url: str, **kw) -> aiohttp.ClientResponse:
-    assert HTTP is not None
-    headers = kw.pop("headers", {})
-    resp = await HTTP.get(url, headers={**UA, **headers}, **kw)
-    return resp
+# ========== Util json & storage ==========
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
-# ========== KRIPTO: simbol & harga ==========
-SUPPORTED_FIATS: set[str] = set()
-SYMBOL_MAP: Dict[str, str] = {}   # "btc" -> "bitcoin"
-SYMBOL_LAST = 0.0
-SYM_TTL = 6*3600  # 6 jam
+ensure_dir(DATA_DIR)
 
-PAIR_RX = re.compile(r"^\s*([a-z0-9]{2,12})(?:[ /:_-]([a-z0-9]{2,12}))?\s*$", re.I)
-AMT_RX  = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s+([a-z0-9]{2,12})\s+([a-z0-9]{2,12})\s*$", re.I)
-
-async def refresh_supported_markets(force: bool=False):
-    global SUPPORTED_FIATS, SYMBOL_MAP, SYMBOL_LAST
-    if not force and (time.time()-SYMBOL_LAST) < SYM_TTL and SYMBOL_MAP:
-        return
+def load_json(path: str, default: Any) -> Any:
     try:
-        # vs_currencies
-        r = await http_get("https://api.coingecko.com/api/v3/simple/supported_vs_currencies", timeout=20)
-        if r.status == 200:
-            SUPPORTED_FIATS = set(await r.json())
-        else:
-            SUPPORTED_FIATS = {"usd","idr","eur","usdt"}
-        # coins/list
-        r = await http_get("https://api.coingecko.com/api/v3/coins/list?include_platform=false", timeout=40)
-        if r.status == 200:
-            arr = await r.json()
-            m: Dict[str,str] = {}
-            for it in arr:
-                sym = (it.get("symbol") or "").lower()
-                cid = (it.get("id") or "").lower()
-                name= (it.get("name") or "").lower()
-                if sym and cid:
-                    m.setdefault(sym, cid)
-                    m.setdefault(name, cid)
-                    m.setdefault(cid, cid)
-            if m:
-                SYMBOL_MAP = m
-                SYMBOL_LAST = time.time()
-                log.info("Loaded symbols: %d entries", len(SYMBOL_MAP))
-    except Exception as e:
-        log.warning("refresh_supported_markets error: %s", e)
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
-def fiat_ok(f: str) -> bool:
-    return f.lower() in SUPPORTED_FIATS if SUPPORTED_FIATS else f.lower() in {"usd","idr","eur","usdt"}
+def save_json(path: str, data: Any) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
-def coin_id(sym: str) -> Optional[str]:
-    return SYMBOL_MAP.get(sym.lower().strip())
-
-def fmt_price(val: float, fiat: str) -> str:
-    if fiat.lower()=="idr":
-        return f"Rp {val:,.0f}"
-    return f"{val:,.4f} {fiat.upper()}"
-
-async def fetch_price(ids: List[str], fiat: str) -> Dict:
-    if not ids: return {}
-    try:
-        url = "https://api.coingecko.com/api/v3/simple/price"
-        q = {
-            "ids": ",".join(ids),
-            "vs_currencies": fiat,
-            "include_24hr_change": "true"
-        }
-        r = await http_get(url, params=q, timeout=25)
-        if r.status == 200:
-            return await r.json()
-    except Exception as e:
-        log.warning("fetch_price error: %s", e)
-    return {}
-
-def parse_text_price(text: str) -> Tuple[Optional[Tuple[str,str]], Optional[Tuple[float,str,str]]]:
-    m = AMT_RX.match(text or "")
-    if m:
-        return (None, (float(m.group(1)), m.group(2).lower(), m.group(3).lower()))
-    m = PAIR_RX.match(text or "")
-    if m and m.group(2):
-        return ((m.group(1).lower(), m.group(2).lower()), None)
-    return (None, None)
-
-# ========== AIRDROP ==========
+# ========== Dataclass Airdrop ==========
 @dataclass
 class Airdrop:
     slug: str
@@ -140,412 +97,615 @@ class Airdrop:
     reward: Optional[str] = None
     url: Optional[str] = None
     source: Optional[str] = None
+    tasks: Optional[List[str]] = None
 
-AIRDROPS: List[Airdrop] = []
-AIR_LAST = 0.0
-SCRAPE_ERR_RING: List[str] = []
-PER_PAGE = 6
+# Memori runtime
+COINMAP: Dict[str, Dict[str, Any]] = {
+    "_ts": 0,
+    "by_symbol": {},   # "btc" -> {"id":"bitcoin","name":"Bitcoin","symbol":"btc"}
+}
+PRICE_CACHE: Dict[str, Dict[str, Any]] = {}  # key=f"{ids}|{fiat}" -> {"_ts":..., "data": {...}}
+AIRDROPS: Dict[str, Any] = load_json(AIRDROPS_FILE, {"_ts":0, "items":[]})
 
-def push_err(msg: str):
-    ts = time.strftime("%H:%M:%S")
-    SCRAPE_ERR_RING.append(f"[{ts}] {msg}")
-    del SCRAPE_ERR_RING[:-20]
-
-def clean(s: Optional[str]) -> Optional[str]:
-    if not s: return None
-    return re.sub(r"\s+", " ", s).strip() or None
-
-async def scrape_airdrops_io(pages:int=1) -> List[Airdrop]:
-    out: List[Airdrop] = []
-    for p in range(1, max(1,pages)+1):
-        url = f"https://airdrops.io/latest/page/{p}/"
-        r = await http_get(url, timeout=30)
-        if r.status != 200:
-            push_err(f"airdrops.io HTTP {r.status} (page {p})"); break
-        soup = BeautifulSoup(await r.text(), "html.parser")
-        for card in soup.select(".airdrops-list article, .airdrops-list .item"):
-            t = card.select_one(".title, h3, h2, a")
-            name = clean(t.get_text() if t else None)
-            if not name: continue
-            href = t.get("href") if t and t.has_attr("href") else url
-            reward = clean((card.select_one(".reward, .prize, .subtitle") or {}).get_text() if card.select_one(".reward, .prize, .subtitle") else None)
-            chain  = clean((card.select_one(".chain, .platform") or {}).get_text() if card.select_one(".chain, .platform") else None)
-            slug = re.sub(r"[^a-z0-9\-]+","-", name.lower()).strip("-")
-            out.append(Airdrop(slug, name, chain, reward, href, "airdrops.io"))
-    return out
-
-async def scrape_airdropalert(pages:int=1) -> List[Airdrop]:
-    out: List[Airdrop] = []
-    for p in range(1, max(1,pages)+1):
-        url = f"https://airdropalert.com/new-airdrops?page={p}"
-        r = await http_get(url, timeout=30)
-        if r.status == 403:
-            push_err("airdropalert 403 (Forbidden) – skip")
-            break
-        if r.status != 200:
-            push_err(f"airdropalert HTTP {r.status} (page {p})"); break
-        soup = BeautifulSoup(await r.text(), "html.parser")
-        for row in soup.select("article, .airdrop-card, .card, .list-item"):
-            t = row.select_one("h2, h3, .title, a")
-            name = clean(t.get_text() if t else None)
-            if not name: continue
-            href = t.get("href") if t and t.has_attr("href") else url
-            reward = clean((row.select_one(".reward, .rewards, .badge") or {}).get_text() if row.select_one(".reward, .rewards, .badge") else None)
-            chain  = clean((row.select_one(".chain, .network") or {}).get_text() if row.select_one(".chain, .network") else None)
-            slug = re.sub(r"[^a-z0-9\-]+","-", name.lower()).strip("-")
-            out.append(Airdrop(slug, name, chain, reward, href, "airdropalert"))
-    return out
-
-async def scrape_all(pages:int=1) -> Tuple[List[Airdrop], Dict[str,int]]:
-    results: List[Airdrop] = []
-    per: Dict[str,int] = {"airdrops.io":0, "airdropalert":0}
-    for name, fn in [("airdrops.io", scrape_airdrops_io), ("airdropalert", scrape_airdropalert)]:
-        try:
-            chunk = await fn(pages)
-            results.extend(chunk)
-            per[name] = len(chunk)
-        except Exception as e:
-            push_err(f"scrape {name} error: {e}")
-    # dedupe by slug (prefer with reward)
-    uniq: Dict[str,Airdrop] = {}
-    for a in results:
-        if a.slug not in uniq or (a.reward and not uniq[a.slug].reward):
-            uniq[a.slug] = a
-    out = list(uniq.values())
-    return out, per
-
-def filter_airdrops(keyword: str) -> List[Airdrop]:
-    if not keyword: return AIRDROPS
-    kw = keyword.lower()
-    res = []
-    for a in AIRDROPS:
-        blob = " ".join([
-            a.slug or "", a.name or "", a.chain or "",
-            a.reward or "", a.url or "", a.source or ""
-        ]).lower()
-        if kw in blob: res.append(a)
-    return res
-
-def render_airdrops(items: List[Airdrop], page:int, size:int=PER_PAGE) -> Tuple[str,int]:
-    total = len(items)
-    pages = max(1, math.ceil(total/size))
-    page = max(1, min(page, pages))
-    i0 = (page-1)*size
-    view = items[i0:i0+size]
-    lines = [f"Airdrop: {total} item (hal {page}/{pages})\n"]
-    for a in view:
-        line = f"• <b>{html.escape(a.name)}</b>"
-        if a.reward: line += f" — {html.escape(a.reward)}"
-        if a.chain:  line += f" ({html.escape(a.chain)})"
-        if a.url:    line += f"\n  <a href=\"{html.escape(a.url)}\">{html.escape(a.source or 'link')}</a>"
-        lines.append(line)
-    if not view: lines.append("Tidak ada data.")
-    return "\n".join(lines), pages
-
-def air_kb(page:int, pages:int, kw:str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("« Prev", callback_data=f"air:prev:{page}:{kw}"),
-         InlineKeyboardButton(f"{page}/{pages}", callback_data="air:nop"),
-         InlineKeyboardButton("Next »", callback_data=f"air:next:{page}:{kw}")],
-        [InlineKeyboardButton("🔄 Refresh", callback_data=f"air:refresh:{page}:{kw}")]
-    ])
-
-# ========== RATE LIMIT (ringan) ==========
-LAST_HIT: Dict[int, float] = {}
-def too_fast(user_id: int, sec: float=0.8) -> bool:
-    t = time.time()
-    last = LAST_HIT.get(user_id, 0.0)
-    if (t - last) < sec:
-        return True
-    LAST_HIT[user_id] = t
-    return False
-
-# ========== COMMANDS ==========
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    txt = (
-        "👋 <b>AirdropCore Ultra Pro</b>\n"
-        "• /menu — tombol cepat\n"
-        "• /price <coin> [fiat]\n"
-        "• /prices btc,eth [fiat]\n"
-        "• /convert <amt> <coin> <fiat>\n"
-        "• /airupdate [pages] [force]\n"
-        "• /airdrops [keyword], /airnews, /airstatus, /airdebug\n"
-        "• /about, /ping, /stats\n\n"
-        "Ketik bebas: <code>btc idr</code> atau <code>0.25 sol usd</code>. "
-        "Pertanyaan umum → AI (jika API Key aktif)."
-    )
-    await update.message.reply_html(txt)
-
-async def menu_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💰 Harga", callback_data="m:price"),
-         InlineKeyboardButton("🔁 Convert", callback_data="m:conv")],
-        [InlineKeyboardButton("🎁 Airdrops", callback_data="m:air"),
-         InlineKeyboardButton("🤖 AI", callback_data="m:ai")],
-        [InlineKeyboardButton("ℹ️ About", callback_data="m:about")]
-    ])
-    await update.message.reply_text("Pilih menu:", reply_markup=kb)
-
-async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    data = q.data or ""
-    if data == "m:price":
-        txt = "Contoh:\n• /price btc usdt\n• /prices btc,eth idr\n• Teks bebas: <code>btc idr</code>"
-    elif data == "m:conv":
-        txt = "Konversi:\n• /convert 0.25 btc idr\n• Teks bebas: <code>0.25 sol usd</code>"
-    elif data == "m:air":
-        txt = "Airdrops:\n• /airupdate • /airdrops [kw]\n• /airnews • /airstatus • /airdebug"
-    elif data == "m:ai":
-        txt = "Ketik pertanyaan apa saja (AI)."
-    else:
-        txt = "AirdropCore Ultra Pro — by AirdropCore.com"
-    await q.edit_message_text(txt, parse_mode="HTML")
-
-async def about_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_html(
-        "<b>AirdropCore Ultra Pro</b>\n"
-        "Fokus: intel airdrop + utilitas kripto + AI analitis.\n"
-        "Optimized async I/O, cache simbol CoinGecko, dan pagination yang halus."
-    )
-
-async def ping_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong")
-
-async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"Airdrops: {len(AIRDROPS)} | Symbols: {len(SYMBOL_MAP)} | Fiats: {len(SUPPORTED_FIATS)}"
-    )
-
-# ---- Harga & Konversi
-async def price_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text("Format: /price <coin> [fiat]"); return
-    coin = ctx.args[0].lower()
-    fiat = (ctx.args[1] if len(ctx.args)>1 else FIAT_DEFAULT).lower()
-    cid = coin_id(coin)
-    if not cid or not fiat_ok(fiat): return
-    data = await fetch_price([cid], fiat)
-    if not data or cid not in data or fiat not in data[cid]: return
-    val = float(data[cid][fiat]); chg = data[cid].get(f"{fiat}_24h_change")
-    chg_txt = f" (24h: {chg:+.2f}%)" if isinstance(chg,(int,float)) else ""
-    await update.message.reply_text(f"💰 {coin.upper()} = {fmt_price(val, fiat)}{chg_txt}")
-
-async def prices_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text("Format: /prices btc,eth [fiat]"); return
-    coins = [s.strip().lower() for s in ctx.args[0].split(",") if s.strip()]
-    fiat = (ctx.args[1] if len(ctx.args)>1 else FIAT_DEFAULT).lower()
-    ids = [c for c in (coin_id(c) for c in coins) if c]
-    if not ids or not fiat_ok(fiat): return
-    data = await fetch_price(ids, fiat)
-    if not data: return
-    lines=[]
-    for c in coins:
-        cid = coin_id(c)
-        if cid and cid in data and fiat in data[cid]:
-            lines.append(f"• {c.upper()} = {fmt_price(float(data[cid][fiat]), fiat)}")
-    if lines: await update.message.reply_text("\n".join(lines))
-
-async def convert_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if len(ctx.args) < 3:
-        await update.message.reply_text("Format: /convert <amt> <coin> <fiat>"); return
+# ========== Coin map (CoinGecko) ==========
+async def refresh_coinmap_if_needed() -> None:
+    # pakai TTL dan file cache
+    now = time.time()
+    if (now - COINMAP["_ts"]) < COINMAP_TTL and COINMAP["by_symbol"]:
+        return
+    # coba muat dari file dulu
+    filedata = load_json(COINMAP_FILE, {})
+    if filedata and (now - filedata.get("_ts", 0)) < COINMAP_TTL and filedata.get("by_symbol"):
+        COINMAP.update(filedata)
+        return
+    # fetch dari API
     try:
-        amt = float(ctx.args[0])
-    except:
-        return
-    coin = ctx.args[1].lower(); fiat = ctx.args[2].lower()
-    cid = coin_id(coin)
-    if not cid or not fiat_ok(fiat): return
-    data = await fetch_price([cid], fiat)
-    if not data or cid not in data or fiat not in data[cid]: return
-    out = float(data[cid][fiat]) * amt
-    await update.message.reply_text(f"≈ {fmt_price(out, fiat)}")
+        assert HTTP is not None
+        url = f"{COINGECKO}/coins/list?include_platform=false"
+        r = await HTTP.get(url, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        items = r.json()
+        by_symbol = {}
+        for it in items:
+            sym = (it.get("symbol") or "").lower()
+            if not sym:
+                continue
+            # kalau simbol bentrok, prioritaskan yg market cap besar? Tidak ada data—ambil pertama
+            if sym not in by_symbol:
+                by_symbol[sym] = {"id": it["id"], "name": it.get("name",""), "symbol": sym}
+        COINMAP["_ts"] = now
+        COINMAP["by_symbol"] = by_symbol
+        save_json(COINMAP_FILE, COINMAP)
+        log.info("Coin map terbarui (%d simbol)", len(by_symbol))
+    except Exception as e:
+        log.warning("Gagal refresh coin map: %s", e)
 
-# ---- Airdrops
-async def airupdate_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    pages = 1; force = False
-    if ctx.args:
-        try: pages = max(1, int(ctx.args[0]))
-        except: pass
-        if len(ctx.args)>1 and ctx.args[1].lower() in {"1","true","force"}: force=True
+def norm_symbol_to_id(sym: str) -> Optional[str]:
+    sym = (sym or "").lower().strip()
+    if not sym:
+        return None
+    d = COINMAP.get("by_symbol", {})
+    return d.get(sym, {}).get("id")
 
-    global AIRDROPS, AIR_LAST
-    if (time.time()-AIR_LAST < 180) and not force:
-        await update.message.reply_text("⏳ Terlalu sering. Tambahkan argumen 'force' untuk paksa.")
-        return
-    msg = await update.message.reply_text(f"🔄 Update airdrops (pages={pages}, force={force})…")
-    new, per = await scrape_all(pages)
-    AIRDROPS = new
-    AIR_LAST = time.time()
-    lines = [f"✅ Selesai. Terkumpul {len(AIRDROPS)} airdrop.", "Per sumber:"]
-    for k,v in per.items(): lines.append(f"• {k}: {v}")
-    if SCRAPE_ERR_RING:
-        lines.append("\n⚠️ Error:")
-        lines.extend(" - "+e for e in SCRAPE_ERR_RING[-4:])
-    await msg.edit_text("\n".join(lines))
+# ========== Harga / Konversi ==========
+ALLOWED_FIAT = {"usd","usdt","idr","eur","jpy","gbp","inr"}
 
-def air_kb_wrap(page:int, pages:int, kw:str) -> InlineKeyboardMarkup:
-    return air_kb(page, pages, kw)
+async def get_simple_price(ids: List[str], fiat: str) -> Optional[Dict[str, Any]]:
+    if not ids:
+        return None
+    fiat = fiat.lower()
+    cache_key = f"{','.join(ids)}|{fiat}"
+    now = time.time()
+    c = PRICE_CACHE.get(cache_key)
+    if c and now - c.get("_ts", 0) < PRICE_TTL:
+        return c["data"]
+    try:
+        assert HTTP is not None
+        params = {
+            "ids": ",".join(ids),
+            "vs_currencies": fiat,
+            "include_24hr_change": "true"
+        }
+        r = await HTTP.get(f"{COINGECKO}/simple/price", params=params, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        PRICE_CACHE[cache_key] = {"_ts": now, "data": data}
+        return data
+    except Exception as e:
+        log.warning("get_simple_price gagal: %s", e)
+        return None
 
-async def airdrops_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    kw = " ".join(ctx.args) if ctx.args else ""
-    items = filter_airdrops(kw)
-    text, pages = render_airdrops(items, 1)
-    await update.message.reply_html(text, reply_markup=air_kb_wrap(1, pages, kw), disable_web_page_preview=True)
+def fmt_price(x: float, fiat: str) -> str:
+    if x >= 1:
+        s = f"{x:,.2f}"
+    elif x >= 0.01:
+        s = f"{x:,.4f}"
+    else:
+        s = f"{x:.8f}".rstrip("0")
+    return f"{s} {fiat.upper()}"
 
-async def air_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    data = q.data or ""
-    if not data.startswith("air:"): return
-    _, action, p, *rest = data.split(":", 3)
-    page = int(p) if p.isdigit() else 1
-    kw = rest[0] if rest else ""
-    items = filter_airdrops(kw)
-    _, pages = render_airdrops(items, page)
-    if action=="next": page = min(page+1, pages)
-    elif action=="prev": page = max(page-1, 1)
-    # refresh → tetap page yang sama
-    text, pages = render_airdrops(items, page)
-    await q.edit_message_text(text, reply_markup=air_kb_wrap(page, pages, kw), parse_mode="HTML", disable_web_page_preview=True)
+# ========== Parsing teks bebas untuk price/convert ==========
+RE_AMOUNT_PAIR = re.compile(r"^\s*(?P<amt>\d+(?:[.,]\d+)?)\s+(?P<base>[A-Za-z0-9]+)\s+(?P<fiat>[A-Za-z]{2,6})\s*$")
+RE_PAIR = re.compile(r"^\s*(?P<base>[A-Za-z0-9]{2,15})\s+(?P<fiat>[A-Za-z]{2,6})\s*$")
+RE_CSV = re.compile(r"^\s*(?P<bases>[A-Za-z0-9, ]+)\s+(?P<fiat>[A-Za-z]{2,6})\s*$")
 
-async def airnews_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    items = AIRDROPS[:5]
+# ========== Scraper helper ==========
+UA_HEADERS = {
+    "User-Agent": f"{BRAND}-Bot/1.0 (+https://t.me/) Python-httpx"
+}
+
+def _clean_text(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    s = " ".join(s.split())
+    return s.strip() or None
+
+async def scrape_airdrops_io() -> List[Airdrop]:
+    url = "https://airdrops.io/latest/"
+    try:
+        assert HTTP is not None
+        r = await HTTP.get(url, headers=UA_HEADERS, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        out: List[Airdrop] = []
+        for it in soup.select(".airdrops-list .item"):
+            ttl = _clean_text(it.select_one(".title, h3, h2").get_text() if it.select_one(".title, h3, h2") else None)
+            if not ttl: 
+                continue
+            href = it.select_one("a")
+            reward = _clean_text((it.select_one(".reward, .prize, .subtitle") or {}).get_text() if it.select_one(".reward, .prize, .subtitle") else None)
+            chain  = _clean_text((it.select_one(".chain, .platform") or {}).get_text() if it.select_one(".chain, .platform") else None)
+            url_item = href.get("href") if href and href.has_attr("href") else url
+            slug = ttl.lower().replace(" ","-")
+            out.append(Airdrop(slug=slug, name=ttl, chain=chain, reward=reward, url=url_item, source="airdrops.io"))
+        return out
+    except Exception as e:
+        log.warning("scrape airdrops.io gagal: %s", e)
+        return []
+
+async def scrape_airdropalert() -> List[Airdrop]:
+    url = "https://airdropalert.com/latest-airdrops"
+    try:
+        assert HTTP is not None
+        r = await HTTP.get(url, headers=UA_HEADERS, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        out: List[Airdrop] = []
+        cards = soup.select("article, .airdrop, .card, .blog-post")
+        if not cards:
+            cards = soup.select("a[href*='/airdrop/']")
+        for it in cards:
+            # title
+            ttl_el = it.select_one("h2, h3, .title, .entry-title") or it
+            ttl = _clean_text(ttl_el.get_text())
+            if not ttl:
+                continue
+            href = it.select_one("a")
+            url_item = href.get("href") if (href and href.has_attr("href")) else url
+            reward = _clean_text((it.select_one(".reward, .prize, .subtitle, .post-description") or {}).get_text() if it.select_one(".reward, .prize, .subtitle, .post-description") else None)
+            chain = _clean_text((it.select_one(".chain, .platform, .network") or {}).get_text() if it.select_one(".chain, .platform, .network") else None)
+            slug = ttl.lower().replace(" ","-")
+            out.append(Airdrop(slug=slug, name=ttl, chain=chain, reward=reward, url=url_item, source="airdropalert.com"))
+        return out
+    except Exception as e:
+        log.warning("scrape airdropalert gagal: %s", e)
+        return []
+
+async def scrape_airdrops_fun() -> List[Airdrop]:
+    url = "https://airdrops.fun/"
+    try:
+        assert HTTP is not None
+        r = await HTTP.get(url, headers=UA_HEADERS, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        out: List[Airdrop] = []
+        for it in soup.select("article, .card, .post, .airdrops-item"):
+            ttl = _clean_text((it.select_one("h2, h3, .title") or it).get_text())
+            if not ttl: continue
+            href = it.select_one("a")
+            url_item = href.get("href") if (href and href.has_attr("href")) else url
+            reward = _clean_text((it.select_one(".reward, .subtitle, .entry-summary") or {}).get_text() if it.select_one(".reward, .subtitle, .entry-summary") else None)
+            chain = _clean_text((it.select_one(".chain, .platform, .network") or {}).get_text() if it.select_one(".chain, .platform, .network") else None)
+            slug = ttl.lower().replace(" ","-")
+            out.append(Airdrop(slug=slug, name=ttl, chain=chain, reward=reward, url=url_item, source="airdrops.fun"))
+        return out
+    except Exception as e:
+        log.warning("scrape airdrops.fun gagal: %s", e)
+        return []
+
+async def scrape_all() -> Tuple[List[Airdrop], Dict[str,int]]:
+    results: List[Airdrop] = []
+    per_src: Dict[str,int] = {}
+    for fn, name in ((scrape_airdrops_io, "airdrops.io"),
+                     (scrape_airdropalert, "airdropalert.com"),
+                     (scrape_airdrops_fun, "airdrops.fun")):
+        arr = await fn()
+        results.extend(arr)
+        per_src[name] = len(arr)
+    # dedupe by slug; pilih yang punya reward dulu
+    mp: Dict[str, Airdrop] = {}
+    for a in results:
+        k = a.slug
+        if k not in mp:
+            mp[k] = a
+        else:
+            if (a.reward and not mp[k].reward):
+                mp[k] = a
+    out = list(mp.values())
+    # sort by name
+    out.sort(key=lambda x: x.name.lower())
+    return out, per_src
+
+# ========== Telegram Helpers ==========
+def kb_main() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💰 Harga", callback_data="menu_price"),
+         InlineKeyboardButton("🔄 Convert", callback_data="menu_convert")],
+        [InlineKeyboardButton("🎁 Airdrop", callback_data="menu_air"),
+         InlineKeyboardButton("🤖 AI", callback_data="menu_ai")],
+    ])
+
+def paginate(items: List[Airdrop], page: int, size: int = 10) -> Tuple[List[Airdrop], int]:
+    n = len(items)
+    pages = max(1, math.ceil(n/size))
+    page = max(1, min(page, pages))
+    start = (page-1)*size
+    return items[start:start+size], pages
+
+def airdrop_list_text(items: List[Airdrop], page: int, pages: int) -> str:
     if not items:
-        await update.message.reply_text("Belum ada data. Jalankan /airupdate."); return
-    lines = ["🆕 Airdrop terbaru:"]
+        return "Belum ada data airdrop. Jalankan /airupdate."
+    lines = [f"Daftar Airdrop (page {page}/{pages}):"]
+    for i, a in enumerate(items, 1):
+        nm = html.escape(a.name)
+        src = a.source or "-"
+        rw = a.reward or "-"
+        lines.append(f"{i}. {nm} • {src} • {rw}")
+    lines.append("\nGunakan /tugas <keyword> untuk detail.")
+    return "\n".join(lines)
+
+# ========== Command Handlers ==========
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (
+        f"Selamat datang di {BRAND} (AI ultra-pro).\n\n"
+        "Perintah ringkas:\n"
+        "• /price <coin> <fiat>\n"
+        "• /prices btc,eth idr\n"
+        "• /convert 0.25 btc usd\n"
+        "• /setfiat idr|usd|usdt|eur\n"
+        "• /airupdate [pages] [force]\n"
+        "• /airdrops  — daftar + tombol Next/Prev\n"
+        "• /tugas <keyword> — detail airdrop\n\n"
+        "Ketik bebas (tanpa /ask) untuk tanya AI."
+    )
+    if update.message:
+        await update.message.reply_text(text, reply_markup=kb_main())
+
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Bantuan cepat:\n"
+        "/price btc usdt — harga 1 koin\n"
+        "/prices btc,eth idr — beberapa koin\n"
+        "/convert 12.5 sol usd — konversi\n"
+        "/setfiat usd — ganti default fiat\n"
+        "/airupdate 1 true — update airdrop (paksa)\n"
+        "/airdrops — lihat daftar (Next/Prev)\n"
+        "/tugas <keyword> — detail airdrop\n"
+        "Teks bebas → AI."
+    )
+
+async def setfiat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global FIAT_DEFAULT
+    if not ctx.args:
+        await update.message.reply_text(f"FIAT saat ini: {FIAT_DEFAULT.upper()}\nFormat: /setfiat idr|usd|usdt|eur")
+        return
+    fiat = ctx.args[0].lower()
+    if fiat not in ALLOWED_FIAT:
+        await update.message.reply_text("❌ Fiat tidak didukung.")
+        return
+    FIAT_DEFAULT = fiat
+    await update.message.reply_text(f"✅ FIAT default di-set ke {fiat.upper()}")
+
+# ---- Harga satu koin
+async def price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if len(ctx.args) < 1:
+        await update.message.reply_text("Format: /price <coin> [fiat]\ncontoh: /price btc usdt")
+        return
+    base = ctx.args[0].lower()
+    fiat = (ctx.args[1].lower() if len(ctx.args) > 1 else FIAT_DEFAULT)
+    await reply_price(update, base, fiat)
+
+# ---- Harga banyak koin: /prices btc,eth idr
+async def prices(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("Format: /prices btc,eth,sol [fiat]")
+        return
+    parts = " ".join(ctx.args).split()
+    bases = [b.strip().lower() for b in parts[0].split(",") if b.strip()]
+    fiat = (parts[1].lower() if len(parts) > 1 else FIAT_DEFAULT)
+    # validasi pair; kalau kosong, diam (hemat VPS)
+    ids = [norm_symbol_to_id(b) for b in bases]
+    ids = [i for i in ids if i]
+    if not ids or fiat not in ALLOWED_FIAT:
+        return
+    data = await get_simple_price(ids, fiat)
+    if not data:
+        return
+    lines = []
+    rev = {v["id"]: k for k, v in COINMAP["by_symbol"].items()}
+    for i in ids:
+        sym = rev.get(i, "").upper()
+        p = data.get(i, {}).get(fiat)
+        if p is None:
+            continue
+        chg = data.get(i, {}).get(f"{fiat}_24h_change")
+        chg_txt = f" (24h {chg:+.2f}%)" if isinstance(chg,(int,float)) else ""
+        lines.append(f"• {sym} = {fmt_price(p, fiat)}{chg_txt}")
+    if lines:
+        await update.message.reply_text("\n".join(lines))
+
+# ---- Konversi /convert 0.25 btc usd
+async def convert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if len(ctx.args) < 3:
+        await update.message.reply_text("Format: /convert <jumlah> <coin> <fiat>\ncontoh: /convert 0.25 btc usd")
+        return
+    amt = ctx.args[0].replace(",", ".")
+    try:
+        amount = float(amt)
+    except Exception:
+        return
+    base = ctx.args[1].lower()
+    fiat = ctx.args[2].lower()
+    await reply_convert(update, amount, base, fiat)
+
+async def reply_price(update: Update, base: str, fiat: str):
+    await refresh_coinmap_if_needed()
+    coin_id = norm_symbol_to_id(base)
+    if not coin_id or fiat not in ALLOWED_FIAT:
+        return  # diam
+    data = await get_simple_price([coin_id], fiat)
+    if not data:
+        return
+    price_val = data.get(coin_id, {}).get(fiat)
+    if price_val is None:
+        return
+    chg = data.get(coin_id, {}).get(f"{fiat}_24h_change")
+    chg_txt = f" (24h {chg:+.2f}%)" if isinstance(chg,(int,float)) else ""
+    await update.message.reply_text(f"💰 {base.upper()} = {fmt_price(price_val, fiat)}{chg_txt}")
+
+async def reply_convert(update: Update, amount: float, base: str, fiat: str):
+    await refresh_coinmap_if_needed()
+    coin_id = norm_symbol_to_id(base)
+    if not coin_id or fiat not in ALLOWED_FIAT:
+        return
+    data = await get_simple_price([coin_id], fiat)
+    if not data:
+        return
+    p = data.get(coin_id, {}).get(fiat)
+    if p is None:
+        return
+    val = amount * float(p)
+    await update.message.reply_text(f"🔄 {amount:g} {base.upper()} ≈ {fmt_price(val, fiat)}")
+
+# ---- Airdrop update / daftar / tugas
+async def airupdate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # /airupdate [pages] [force]
+    pages = int(ctx.args[0]) if (len(ctx.args) >= 1 and ctx.args[0].isdigit()) else 1
+    force = str(ctx.args[1]).lower() in {"1","true","yes"} if len(ctx.args) >= 2 else False
+
+    last_ts = AIRDROPS.get("_ts", 0)
+    if not force and (time.time() - last_ts) < 180:  # 3 menit cooldown
+        await update.message.reply_text("⏳ Terlalu sering. Coba lagi beberapa menit.")
+        return
+
+    msg = await update.message.reply_text(f"🔄 Update airdrops (pages={pages}, force={force})…")
+    items_all: List[Airdrop] = []
+    per_src_total: Dict[str,int] = {}
+    for _ in range(pages):
+        arr, per_src = await scrape_all()
+        items_all.extend(arr)
+        for k,v in per_src.items():
+            per_src_total[k] = per_src_total.get(k,0) + v
+
+    # dedupe & simpan
+    seen = {}
+    final: List[Dict[str, Any]] = []
+    for a in items_all:
+        if a.slug in seen:
+            continue
+        seen[a.slug] = 1
+        final.append(asdict(a))
+    AIRDROPS["_ts"] = time.time()
+    AIRDROPS["items"] = final
+    save_json(AIRDROPS_FILE, AIRDROPS)
+
+    lines = [f"✅ Selesai. Terkumpul {len(final)} airdrop.", "Per sumber:"]
+    for k in SCRAPE_SOURCES:
+        lines.append(f"• {k}: {per_src_total.get(k,0)}")
+    await msg.edit_text("\n".join(lines) + "\n\n/airdrops untuk daftar, /airnews untuk yang baru.")
+
+# state paging per chat (in-mem)
+AIRPAGE: Dict[int, int] = {}
+
+async def airdrops(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    AIRPAGE[chat_id] = 1
+    await send_airdrops_page(update, ctx, chat_id, 1)
+
+async def send_airdrops_page(update_or_cb, ctx, chat_id: int, page: int):
+    items = [Airdrop(**it) for it in AIRDROPS.get("items", [])]
+    chunk, pages = paginate(items, page, 10)
+    text = airdrop_list_text(chunk, page, pages)
+
+    kb = []
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"airpage:{page-1}"))
+    if page < pages:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"airpage:{page+1}"))
+    if nav: kb.append(nav)
+    kb.append([InlineKeyboardButton("🔄 Refresh", callback_data="airrefresh")])
+
+    markup = InlineKeyboardMarkup(kb)
+    if isinstance(update_or_cb, Update) and update_or_cb.message:
+        await update_or_cb.message.reply_text(text, reply_markup=markup)
+    else:
+        q = update_or_cb.callback_query
+        await q.edit_message_text(text, reply_markup=markup)
+
+async def tugas(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("Format: /tugas <keyword>")
+        return
+    key = " ".join(ctx.args).lower()
+    items = AIRDROPS.get("items", [])
+    found = None
+    for it in items:
+        if key in it["slug"] or key in it["name"].lower():
+            found = it; break
+    if not found:
+        await update.message.reply_text("❌ Tidak ketemu.")
+        return
+    # Detail “tugas” = ringkas dari reward/chain/url
+    nm = found["name"]; src = found.get("source","-")
+    rw = found.get("reward") or "-"
+    ch = found.get("chain") or "-"
+    url = found.get("url") or "-"
+    txt = (
+        f"🧩 {html.escape(nm)}\n"
+        f"• Sumber: {src}\n"
+        f"• Chain/Platform: {ch}\n"
+        f"• Reward: {rw}\n"
+        f"• Link: {url}\n\n"
+        "Tip: Baca halaman sumber untuk step-by-step task (follow, quest, form, testnet, dsb)."
+    )
+    await update.message.reply_text(txt)
+
+async def airnews(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # tampilkan 10 terbaru
+    items = [Airdrop(**it) for it in AIRDROPS.get("items", [])][:10]
+    if not items:
+        await update.message.reply_text("Belum ada data. /airupdate dulu.")
+        return
+    lines = ["✨ Airdrop terbaru:"]
     for a in items:
-        lines.append(f"• {a.name} — {a.reward or '-'}\n  {a.url or ''}")
+        nm = html.escape(a.name)
+        lines.append(f"• {nm} — {a.source or '-'}")
     await update.message.reply_text("\n".join(lines))
 
-async def airstatus_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    per: Dict[str,int] = {}
-    for a in AIRDROPS: per[a.source or "other"] = per.get(a.source or "other",0)+1
-    last = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(AIR_LAST)) if AIR_LAST else "-"
-    lines = [f"📈 Total: {len(AIRDROPS)} | Last: {last}"]
-    for k,v in sorted(per.items(), key=lambda x:(-x[1], x[0])):
-        lines.append(f"• {k}: {v}")
+async def airstatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    n = len(AIRDROPS.get("items", []))
+    last = AIRDROPS.get("_ts", 0)
+    ago = int(time.time()-last) if last else None
+    lines = [f"🩺 Airdrops: {n} item"]
+    if ago is not None:
+        lines.append(f"• Terakhir update: {ago}s lalu")
     await update.message.reply_text("\n".join(lines))
 
-async def airdebug_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not SCRAPE_ERR_RING:
-        await update.message.reply_text("Tidak ada error terbaru."); return
-    await update.message.reply_text("🛠 Debug:\n" + "\n".join(SCRAPE_ERR_RING[-12:]))
+async def airclear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    AIRDROPS["_ts"] = 0
+    AIRDROPS["items"] = []
+    save_json(AIRDROPS_FILE, AIRDROPS)
+    await update.message.reply_text("🧹 Cache airdrop dibersihkan.")
 
-# ========== AI fallback (gaya “ultra pro”) ==========
-AI_SYSTEM = (
-    "You are AirdropCore Ultra Pro — a crisp, modern crypto & airdrop analyst. "
-    "Write in Indonesian. Be structured, insightful, and pragmatic. "
-    "Use bullets and short paragraphs. Avoid fluff. "
-    "Never invent live prices; if unavailable, be transparent."
-)
+# ---- Callback (menu & paging)
+async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = q.data or ""
+    await q.answer()
+    chat_id = update.effective_chat.id
+    if data == "menu_price":
+        await q.edit_message_text("Contoh:\n• /price btc usdt\n• btc usd (ketik bebas)\n• 0.25 eth idr (konversi)")
+    elif data == "menu_convert":
+        await q.edit_message_text("Contoh konversi:\n/convert 1.2 sol usd\nAtau ketik: 1.2 sol usd")
+    elif data == "menu_air":
+        await send_airdrops_page(update, ctx, chat_id, AIRPAGE.get(chat_id,1))
+    elif data == "menu_ai":
+        await q.edit_message_text("Tanya apa saja, tanpa /ask. Saya jawab gaya profesional.")
+    elif data.startswith("airpage:"):
+        pg = int(data.split(":")[1])
+        AIRPAGE[chat_id] = pg
+        await send_airdrops_page(update, ctx, chat_id, pg)
+    elif data == "airrefresh":
+        await send_airdrops_page(update, ctx, chat_id, AIRPAGE.get(chat_id,1))
 
+# ========== Router teks bebas ==========
 async def text_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-    user_id = update.effective_user.id if update.effective_user else 0
-    if too_fast(user_id):
-        return  # throttled
-
-    txt = update.message.text.strip()
-
-    # 1) harga konversi gaya bebas: "0.25 btc usd"
-    pair, conv = parse_text_price(txt)
-    if conv:
-        amt, coin, fiat = conv
-        cid = coin_id(coin)
-        if not cid: return
-        if not fiat_ok(fiat): return
-        data = await fetch_price([cid], fiat)
-        if not data or cid not in data or fiat not in data[cid]: return
-        out = float(data[cid][fiat]) * amt
-        await update.message.reply_text(f"≈ {fmt_price(out, fiat)}")
+    txt = (update.message.text or "").strip()
+    if not txt:
         return
 
-    # 2) pair sederhana: "btc idr"
-    if pair:
-        coin, fiat = pair
-        fiat = fiat or FIAT_DEFAULT
-        cid = coin_id(coin)
-        if not cid or not fiat_ok(fiat): return
-        data = await fetch_price([cid], fiat)
-        if not data or cid not in data or fiat not in data[cid]: return
-        val = float(data[cid][fiat])
-        chg = data[cid].get(f"{fiat}_24h_change")
-        chg_txt = f" (24h: {chg:+.2f}%)" if isinstance(chg,(int,float)) else ""
-        await update.message.reply_text(f"💰 {coin.upper()} = {fmt_price(val, fiat)}{chg_txt}")
+    # 1) amount pair: "0.5 btc idr"
+    m = RE_AMOUNT_PAIR.match(txt)
+    if m:
+        amt = float(m.group("amt").replace(",", "."))
+        base = m.group("base").lower()
+        fiat = m.group("fiat").lower()
+        await reply_convert(update, amt, base, fiat)
         return
 
-    # 3) fallback AI (opsional)
-    if _openai:
+    # 2) single pair "btc usd"
+    m2 = RE_PAIR.match(txt)
+    if m2:
+        base = m2.group("base").lower()
+        fiat = m2.group("fiat").lower()
+        await reply_price(update, base, fiat)
+        return
+
+    # 3) comma list "btc,eth idr"
+    m3 = RE_CSV.match(txt)
+    if m3:
+        bases = [b.strip().lower() for b in m3.group("bases").split(",") if b.strip()]
+        fiat = m3.group("fiat").lower()
+        ids = []
+        await refresh_coinmap_if_needed()
+        for b in bases:
+            i = norm_symbol_to_id(b)
+            if i: ids.append(i)
+        if ids and fiat in ALLOWED_FIAT:
+            data = await get_simple_price(ids, fiat)
+            if data:
+                lines = []
+                rev = {v["id"]: k for k, v in COINMAP["by_symbol"].items()}
+                for i in ids:
+                    sym = rev.get(i, "").upper()
+                    p = data.get(i, {}).get(fiat)
+                    if p is None: continue
+                    chg = data.get(i, {}).get(f"{fiat}_24h_change")
+                    chg_txt = f" (24h {chg:+.2f}%)" if isinstance(chg,(int,float)) else ""
+                    lines.append(f"• {sym} = {fmt_price(p, fiat)}{chg_txt}")
+                if lines:
+                    await update.message.reply_text("\n".join(lines))
+        return
+
+    # 4) AI fallback (hemat: batasi 3–300 char)
+    if OAI and 3 <= len(txt) <= 300:
         try:
-            resp = _openai.chat.completions.create(
+            await update.message.chat.send_action(ChatAction.TYPING)
+        except Exception:
+            pass
+        try:
+            resp = OAI.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[{"role":"system","content":AI_SYSTEM},{"role":"user","content":txt}],
-                temperature=0.45, max_tokens=650
+                max_tokens=280,
+                temperature=0.5,
+                messages=[
+                    {"role":"system","content": AI_SYSTEM},
+                    {"role":"user","content": txt}
+                ],
             )
-            ans = resp.choices[0].message.content.strip()
+            ans = (resp.choices[0].message.content or "").strip()
             if ans:
                 await update.message.reply_text(ans)
         except Exception as e:
             log.warning("AI error: %s", e)
+    # else: diam
 
-# ========== MAIN ==========
-async def _app_main():
+# ========== Main ==========
+async def on_start(app):
     global HTTP
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN belum diisi (ENV)")
+    HTTP = httpx.AsyncClient(http2=True, timeout=HTTP_TIMEOUT)
+    # warm coinmap
+    try:
+        await refresh_coinmap_if_needed()
+    except Exception:
+        pass
+    log.info("Bot siap.")
 
-    # HTTP session
-    HTTP = aiohttp.ClientSession(
-        timeout=ClientTimeout(total=45),
-        connector=TCPConnector(limit=30, ttl_dns_cache=300, ssl=False)
-    )
-    await refresh_supported_markets(force=True)
-
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # Core
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu", menu_cmd))
-    app.add_handler(CallbackQueryHandler(menu_cb, pattern=r"^m:"))
-
-    app.add_handler(CommandHandler("about", about_cmd))
-    app.add_handler(CommandHandler("ping", ping_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-
-    # Crypto
-    app.add_handler(CommandHandler("price", price_cmd))
-    app.add_handler(CommandHandler("prices", prices_cmd))
-    app.add_handler(CommandHandler("convert", convert_cmd))
-
-    # Airdrops
-    app.add_handler(CommandHandler("airupdate", airupdate_cmd))
-    app.add_handler(CommandHandler("airdrops", airdrops_cmd))
-    app.add_handler(CallbackQueryHandler(air_cb, pattern=r"^air:"))
-    app.add_handler(CommandHandler("airnews", airnews_cmd))
-    app.add_handler(CommandHandler("airstatus", airstatus_cmd))
-    app.add_handler(CommandHandler("airdebug", airdebug_cmd))
-
-    # Free text router
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-
-    log.info("Bot polling…")
-    app.run_polling(drop_pending_updates=True)
-
-async def _cleanup():
+async def on_stop(app):
     global HTTP
     if HTTP:
-        await HTTP.close()
+        await HTTP.aclose()
         HTTP = None
+    log.info("HTTP client ditutup.")
 
 def main():
-    try:
-        asyncio.run(_app_main())
-    finally:
-        try:
-            asyncio.run(_cleanup())
-        except Exception:
-            pass
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN belum diisi di environment.")
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.post_init = on_start
+    app.post_shutdown = on_stop
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("setfiat", setfiat))
+    app.add_handler(CommandHandler("price", price))
+    app.add_handler(CommandHandler("prices", prices))
+    app.add_handler(CommandHandler("convert", convert))
+
+    app.add_handler(CommandHandler("airupdate", airupdate))
+    app.add_handler(CommandHandler("airdrops", airdrops))
+    app.add_handler(CommandHandler("tugas", tugas))
+    app.add_handler(CommandHandler("airnews", airnews))
+    app.add_handler(CommandHandler("airstatus", airstatus))
+    app.add_handler(CommandHandler("airclear", airclear))
+
+    app.add_handler(CallbackQueryHandler(on_cb))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+
+    log.info("Polling…")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
