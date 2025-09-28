@@ -39,7 +39,8 @@ if OPENAI_API_KEY:
         log.warning("OpenAI init gagal: %s", e)
 
 # ========== HTTP SESSION ==========
-HTTP: ClientSession | None = None
+from typing import Optional
+HTTP: Optional[ClientSession] = None
 UA = {
     "User-Agent": "Mozilla/5.0 (AirdropCoreUltraPro/1.0; +https://t.me/) ",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
