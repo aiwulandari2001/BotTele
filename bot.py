@@ -2,7 +2,8 @@
 import os, re, html, json, time, asyncio, logging
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, asdict
-
+from dotenv import load_dotenv
+load_dotenv(override=True)
 import httpx
 from bs4 import BeautifulSoup
 
