@@ -17,8 +17,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 # Jika mau otomatis baca .env, uncomment 2 baris ini:
-# from dotenv import load_dotenv
-# load_dotenv(override=True)
+ from dotenv import load_dotenv
+ load_dotenv(override=True)
 
 BOT_NAME = "AirdropCore (AI)"
 FIAT_DEFAULT = "usd"
