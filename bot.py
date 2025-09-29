@@ -6,7 +6,7 @@ from typing import Optional, List, Dict, Tuple
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
- load_dotenv(override=True)
+load_dotenv(override=True)
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, Application, CommandHandler, MessageHandler,
