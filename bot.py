@@ -735,5 +735,4 @@ def main():
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    asyncio.run(sync_coin_map())  # warm-up mapping
     main()
