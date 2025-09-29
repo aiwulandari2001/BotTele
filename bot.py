@@ -318,20 +318,15 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await start(update, ctx)
-
-async def setfiat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global FIAT_DEFAULT
-    if not ctx.args:
-        await update.message.reply_text(
-            f"FIAT sekarang: {FIAT_DEFAULT.upper()}\nFormat: /setfiat idr|usd|usdt|eur"
-        ); return
-    fiat = ctx.args[0].lower()
-    if fiat not in SUPPORTED_FIAT:
-        await update.message.reply_text("❌ Fiat tidak valid."); return
-    FIAT_DEFAULT = fiat
-    await update.message.reply_text(f"✅ FIAT default diset ke {fiat.upper()}")
-
+    txt = (
+        "Perintah tersedia:\n"
+        "/price &lt;coin&gt; fiat\n"
+        "/prices btc,eth idr\n"
+        "/convert 0.25 btc idr\n"
+        "/setfiat idr|usd|usdt|eur\n"
+        "/ask pertanyaan"
+    )
+    await update.message.reply_text(txt, parse_mode="HTML")
 async def price_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(ctx.args) < 1:
         await update.message.reply_text("Format: /price <coin> [fiat]\nContoh: /price btc usdt"); return
