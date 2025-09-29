@@ -717,6 +717,15 @@ def build_app():
     app.add_handler(InlineQueryHandler(inline_query))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
+    # prefetch coin map beberapa detik setelah start
+    async def _warmup(_):
+        try:
+            await sync_coin_map()
+        except Exception as e:
+            log.warning("Warmup coin map gagal: %s", e)
+
+    app.job_queue.run_once(lambda ctx: asyncio.create_task(_warmup(ctx)), when=5)
+    
     return app
 
 def main():
